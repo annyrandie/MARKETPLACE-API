@@ -1,0 +1,22 @@
+{
+  "name": "marketplace-api",
+  "version": "1.0.0",
+  "description": "Marketplace API — OpenAPI contract + variant B: express-openapi-validator validates requests/responses at the boundary (HW #9)",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "lint:spec": "redocly lint openapi/openapi.yaml",
+    "bundle:spec": "redocly bundle openapi/openapi.yaml -o spec.json",
+    "test": "echo \"no automated tests for variant B — see README, Verification section\" && exit 0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.22.2",
+    "express-openapi-validator": "^5.6.2"
+  },
+  "devDependencies": {
+    "@redocly/cli": "^2.46.0"
+  }
+}
