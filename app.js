@@ -20,7 +20,7 @@ function seedProducts() {
     ['27" monitor', 899900],
   ]) {
     const id = `prod_${nextProductSeq++}`;
-    products.set(id, { id, name, price_cents });
+    products.set(id, { id, name, price_cents, created_at: new Date().toISOString() });
   }
 }
 seedProducts();
@@ -40,27 +40,50 @@ function slugify(text) {
     .replace(/(^-|-$)/g, '');
 }
 
-// Opaque cursor = offset in base64url. The format is deliberately not part
-// of the contract — clients must treat it as a token, not parse it.
-function encodeCursor(offset) {
-  return Buffer.from(String(offset), 'utf8').toString('base64url');
+// Keyset pagination on (created_at, id) — not offset. An offset is a raw
+// array index: an insert ahead of the current page shifts everyone after
+// it, so "page 2" can silently repeat or skip a row. A keyset cursor encodes
+// "the last row I saw" and asks for whatever comes strictly after it in
+// (created_at, id) order, which stays correct no matter what else changed
+// in the dataset — the same technique #12 needs for the real Postgres query.
+function numericSuffix(id) {
+  return Number(id.slice(id.lastIndexOf('_') + 1));
+}
+
+function compareByKeyset(a, b) {
+  if (a.created_at !== b.created_at) return a.created_at < b.created_at ? -1 : 1;
+  return numericSuffix(a.id) - numericSuffix(b.id);
+}
+
+function encodeCursor(item) {
+  const key = { created_at: item.created_at, id: item.id };
+  return Buffer.from(JSON.stringify(key), 'utf8').toString('base64url');
 }
 
 function decodeCursor(cursor) {
-  if (cursor === undefined) return 0;
-  const decoded = Number(Buffer.from(String(cursor), 'base64url').toString('utf8'));
-  if (!Number.isInteger(decoded) || decoded < 0) {
+  if (cursor === undefined) return null;
+  let key;
+  try {
+    key = JSON.parse(Buffer.from(String(cursor), 'base64url').toString('utf8'));
+  } catch {
     throw new ProblemError(400, 'cursor is not a valid opaque token');
   }
-  return decoded;
+  if (typeof key?.created_at !== 'string' || typeof key?.id !== 'string') {
+    throw new ProblemError(400, 'cursor is not a valid opaque token');
+  }
+  return key;
 }
 
-function paginate(allItems, req) {
+// `sortedItems` must already be sorted by compareByKeyset — that invariant
+// is what makes "first index past the cursor" a valid page boundary.
+function paginate(sortedItems, req) {
   const limit = req.query.limit !== undefined ? Number(req.query.limit) : 20;
-  const offset = decodeCursor(req.query.cursor);
-  const items = allItems.slice(offset, offset + limit);
-  const nextOffset = offset + limit;
-  const next_cursor = nextOffset < allItems.length ? encodeCursor(nextOffset) : null;
+  const after = decodeCursor(req.query.cursor);
+  const startIndex = after ? sortedItems.findIndex((item) => compareByKeyset(item, after) > 0) : 0;
+  const from = startIndex === -1 ? sortedItems.length : startIndex;
+  const items = sortedItems.slice(from, from + limit);
+  const hasMore = from + items.length < sortedItems.length;
+  const next_cursor = hasMore ? encodeCursor(items[items.length - 1]) : null;
   return { items, next_cursor };
 }
 
@@ -93,12 +116,13 @@ function createApp() {
   );
 
   app.get('/products', (req, res) => {
-    res.json(paginate(Array.from(products.values()), req));
+    const sorted = Array.from(products.values()).sort(compareByKeyset);
+    res.json(paginate(sorted, req));
   });
 
   app.post('/products', (req, res) => {
     const id = `prod_${nextProductSeq++}`;
-    const product = { id, name: req.body.name, price_cents: req.body.price_cents };
+    const product = { id, name: req.body.name, price_cents: req.body.price_cents, created_at: new Date().toISOString() };
     products.set(id, product);
     res.status(201).json(product);
   });
@@ -112,8 +136,8 @@ function createApp() {
   });
 
   app.get('/orders', (req, res) => {
-    const all = Array.from(orders.values()).sort((a, b) => a.created_at.localeCompare(b.created_at));
-    res.json(paginate(all, req));
+    const sorted = Array.from(orders.values()).sort(compareByKeyset);
+    res.json(paginate(sorted, req));
   });
 
   app.post('/orders', (req, res, next) => {

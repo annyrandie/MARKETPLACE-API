@@ -38,6 +38,20 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ProductPage'
+              examples:
+                twoProducts:
+                  summary: A page of two seeded products, more available
+                  value:
+                    items:
+                      - id: prod_1
+                        name: Mechanical keyboard
+                        price_cents: 249900
+                        created_at: '2026-09-10T12:00:00.000Z'
+                      - id: prod_2
+                        name: Wireless mouse
+                        price_cents: 89900
+                        created_at: '2026-09-10T12:00:00.010Z'
+                    next_cursor: eyJjcmVhdGVkX2F0IjoiMjAyNi0wOS0xMFQxMjowMDowMC4wMTBaIiwiaWQiOiJwcm9kXzIifQ
         '400':
           $ref: '#/components/responses/BadRequest'
     post:
@@ -134,6 +148,17 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Order'
+              examples:
+                singleItemOrder:
+                  summary: An order for one mechanical keyboard
+                  value:
+                    id: order_1
+                    status: created
+                    items:
+                      - product_id: prod_1
+                        quantity: 1
+                    total_cents: 249900
+                    created_at: '2026-09-10T12:05:00.000Z'
         '400':
           $ref: '#/components/responses/BadRequest'
         '404':
@@ -243,7 +268,7 @@ components:
 
     Product:
       type: object
-      required: [id, name, price_cents]
+      required: [id, name, price_cents, created_at]
       properties:
         id:
           type: string
@@ -253,10 +278,15 @@ components:
           type: integer
           description: Price in cents (integer, not a decimal string and not a float).
           minimum: 0
+        created_at:
+          type: string
+          format: date-time
+          description: Used as the secondary sort key for keyset pagination, together with id.
 
     NewProduct:
       type: object
       required: [name, price_cents]
+      additionalProperties: false
       properties:
         name:
           type: string
@@ -281,6 +311,7 @@ components:
     OrderItem:
       type: object
       required: [product_id, quantity]
+      additionalProperties: false
       properties:
         product_id:
           type: string
@@ -291,6 +322,7 @@ components:
     NewOrder:
       type: object
       required: [items]
+      additionalProperties: false
       properties:
         items:
           type: array
