@@ -4,4 +4,5 @@ spec.json
 .env
 .env.*
 !.env.example
+secrets/db_password
 .DS_Store

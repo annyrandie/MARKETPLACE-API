@@ -1,10 +1,61 @@
+require('dotenv/config');
+
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { readFile } = require('node:fs/promises');
 const { STATUS_CODES } = require('node:http');
 const express = require('express');
 const OpenApiValidator = require('express-openapi-validator');
+const { Pool } = require('pg');
+const { validate } = require('./src/config/env.schema');
+
+// Fail-fast: either the process starts with a fully valid config, or it
+// doesn't start at all — and says in plain language which variable is
+// broken, before any server/DB setup runs at all.
+let env;
+try {
+  env = validate(process.env);
+} catch (err) {
+  console.error(`✗ App is not starting — invalid configuration.\n${err.message}`);
+  process.exit(1);
+}
 
 const SPEC_PATH = path.join(__dirname, 'openapi', 'openapi.yaml');
+const PASSWORD_FILE = path.resolve(__dirname, env.DB_PASSWORD_FILE);
+
+const LOG_LEVELS = ['debug', 'info', 'warn', 'error'];
+function log(level, ...args) {
+  if (LOG_LEVELS.indexOf(level) >= LOG_LEVELS.indexOf(env.LOG_LEVEL)) {
+    console.log(`[${level}]`, ...args);
+  }
+}
+
+// pg only calls an async `password` function when the connection is given
+// as discrete host/port/database/user — passing `connectionString` instead
+// makes it silently ignore the function and send no password at all. So
+// DB_URL is parsed by hand here rather than handed to pg as-is.
+const dbUrl = new URL(env.DB_URL);
+
+// Password is a FILE, not an env var: env is read once at process start and
+// "freezes", but a file can be re-read. pg calls this function on every new
+// connection — old pool connections keep the old password (Postgres only
+// checks it at handshake), new ones pick up whatever rotate.sh last wrote.
+const pool = new Pool({
+  host: dbUrl.hostname,
+  port: dbUrl.port ? Number(dbUrl.port) : 5432,
+  database: dbUrl.pathname.slice(1),
+  user: decodeURIComponent(dbUrl.username),
+  password: async () => (await readFile(PASSWORD_FILE, 'utf8')).trim(),
+  connectionTimeoutMillis: env.TIMEOUT_MS,
+  max: 5,
+});
+
+// REQUIRED: when Postgres closes an idle connection (rotation, failover,
+// pg_terminate_backend), the pool emits 'error'. Without this handler Node
+// crashes on an unhandled 'error' event — the pool itself reopens a new one.
+pool.on('error', (err) => {
+  log('warn', `pool recovered from a dropped connection (${err.code}) — new connections use the current password`);
+});
 
 const products = new Map();
 const orders = new Map();
@@ -104,6 +155,21 @@ function hashBody(body) {
 
 function createApp() {
   const app = express();
+
+  // Registered before the OpenAPI validator on purpose: /health is an
+  // operational endpoint, not a business resource, so it isn't part of the
+  // spec — and being first means it never reaches (and is never rejected
+  // by) the validator's routing. It's also the endpoint that proves the DB
+  // pool + password rotation actually work: 200 only if the query succeeds.
+  app.get('/health', async (req, res) => {
+    try {
+      await pool.query('SELECT 1');
+      res.json({ status: 'ok', uptimeSec: process.uptime() });
+    } catch (err) {
+      log('error', 'health check failed:', err.message);
+      res.status(503).json({ status: 'error', uptimeSec: process.uptime() });
+    }
+  });
 
   app.use(express.json());
 
@@ -222,8 +288,7 @@ function createApp() {
 module.exports = { createApp };
 
 if (require.main === module) {
-  const PORT = Number(process.env.PORT ?? 3000);
-  createApp().listen(PORT, () => {
-    console.log(`marketplace-api listening on http://localhost:${PORT}`);
+  createApp().listen(env.PORT, () => {
+    log('info', `marketplace-api listening on http://localhost:${env.PORT}`);
   });
 }

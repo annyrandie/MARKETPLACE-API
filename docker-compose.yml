@@ -1,0 +1,20 @@
+# Postgres for local development and the password-rotation demo (HW #11).
+# The app itself runs on the host (`npm start`), not as a compose service —
+# it only needs to see this container on localhost:5433.
+name: marketplace-api
+services:
+  db:
+    image: postgres:16-alpine
+    ports:
+      - '5433:5432'
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin-bootstrap-only # admin for ALTER ROLE; the app never connects as this user
+      POSTGRES_DB: marketplace
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U admin -d marketplace']
+      interval: 2s
+      timeout: 2s
+      retries: 15
