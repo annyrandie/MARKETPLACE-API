@@ -1,7 +1,10 @@
 # Marketplace API
 
 Course project HW #9: a contract (`openapi/openapi.yaml`) plus a working
-boundary that actually enforces it.
+boundary that actually enforces it. HW #11 adds the configuration skeleton
+underneath it: `process.env` → zod schema (fail-fast) → typed config → code,
+and a DB password that lives in a file and rotates without a restart. See
+[Configuration](#configuration) below.
 
 **Chosen variant — B: runtime validation at the boundary.**
 `app.js` is an Express server where `express-openapi-validator` validates
@@ -16,7 +19,16 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | File / folder | Purpose |
 |---|---|
 | `openapi/openapi.yaml` | contract: 2 resources (`products`, `orders`), 6 operations, cursor pagination, `Idempotency-Key`, `problem+json` |
-| `app.js` | Express + `express-openapi-validator` at the boundary, in-memory data |
+| `app.js` | Express + `express-openapi-validator` at the boundary, in-memory data, config bootstrap, `/health` |
+| `src/config/env.schema.js` | zod schema for `process.env` + `validate()` |
+| `scripts/check-env-example.mjs` | `npm run check:env` — syncs `.env.example` against the schema |
+| `.env.example` | full variable contract; `.env` is gitignored |
+| `secrets/db_password` | file-based DB secret (gitignored) |
+| `rotate.sh` | rotates the DB password with the app still running |
+| `scripts/up-db.sh` | brings up Postgres and aligns the role's password with the secret file |
+| `docker-compose.yml` | Postgres for local runs and the rotation demo |
+| `Dockerfile` + `.dockerignore` | app image with no secrets in any layer |
+| `init.sql` | creates `app_user`, the role the app connects as |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -37,8 +49,125 @@ products (`prod_1`, `prod_2`, `prod_3`) on startup.
 
 ```bash
 npm install
-npm start          # starts the server on :3000, catalog seeded with three products
+cp .env.example .env      # first time only — fill in real-looking local values
+npm run db:up              # starts Postgres (docker compose) on :5433
+npm start                   # starts the server on :3000, catalog seeded with three products
 ```
+
+`npm start` validates the config and exits immediately (non-zero) if it's
+broken — it does **not** require Postgres to be reachable to boot (the
+schema only checks that `DB_URL` is a well-formed `postgres://` URL, not
+that anything is listening on it). Only `/health` — and, later, any
+DB-backed route — needs Postgres actually up.
+
+## Configuration
+
+### Variables
+
+All of them are validated by one zod schema (`src/config/env.schema.js`) at
+process start — see [Fail-fast](#fail-fast-not-fail-late) below. The rest of
+the code reads a single typed, frozen `env` object; nothing else in `app.js`
+touches `process.env` directly.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `PORT` | no | `3000` | HTTP server port |
+| `DB_URL` | **yes** | — | Postgres connection string, **without** a password (`postgres://app_user@127.0.0.1:5433/marketplace`) |
+| `DB_PASSWORD_FILE` | no | `secrets/db_password` | path to the file holding the current DB password |
+| `LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
+| `TIMEOUT_MS` | no | `5000` | Postgres connection timeout, ms |
+
+The DB password is deliberately **not** one of these variables — see
+[Secrets](#secrets) below for why.
+
+### Fail-fast, not fail-late
+
+`src/config/env.schema.js` exports a pure `validate(raw)` — it throws with
+every broken variable listed, it never calls `process.exit` itself. `app.js`
+calls it once, at the very top, before the Express app, the DB pool, or
+anything else exists:
+
+```js
+try {
+  env = validate(process.env);
+} catch (err) {
+  console.error(`✗ App is not starting — invalid configuration.\n${err.message}`);
+  process.exit(1);
+}
+```
+
+A broken/missing variable kills the process at boot with a readable message
+— not on the first request that happens to touch it in production.
+
+```bash
+env -u DB_URL npm run start
+# ✗ App is not starting — invalid configuration.
+# Invalid configuration:
+#   DB_URL: Invalid input: expected string, received undefined
+# Compare your .env with .env.example.
+echo $?   # 1
+```
+
+### `.env.example` stays honest
+
+`npm run check:env` compares `.env.example`'s variable names against the
+schema's keys in both directions — missing *or* extra — and fails CI the
+moment they drift apart:
+
+```bash
+npm run check:env
+# ✓ .env.example is in sync with the schema (5 variables)
+```
+
+### Secrets
+
+- **`.env` is gitignored** (`git check-ignore .env` → `.env`; `git ls-files | grep '\.env'` → only `.env.example`). Real values never leave your machine.
+- **The DB password is a *file*, not an env var.** `secrets/db_password` is
+  gitignored too. `app.js` passes `password: async () => (await
+  readFile(...)).trim()` to `pg.Pool` — pg calls this function on **every
+  new connection**, so the password can change without restarting the
+  process. (This only works with discrete `host`/`port`/`database`/`user`
+  fields — `pg` silently ignores an async `password` function if you also
+  pass `connectionString`, which is why `app.js` parses `DB_URL` by hand
+  instead of handing it straight to `Pool`.)
+- **Nothing secret is in the image.** `.dockerignore` excludes `.env` and
+  `secrets/`; the `Dockerfile` has no `ENV` with a real value and no `RUN`
+  that touches a secret. Verify after `docker build -t myapp .`:
+
+  ```bash
+  docker run --rm myapp ls -a /app                        # .env.example, no .env, no secrets/
+  docker run --rm myapp sh -c 'cat /app/.env' 2>&1         # No such file or directory
+  docker inspect --format '{{.Config.Env}}' myapp          # only base-image vars
+  docker history --no-trunc myapp | grep -i password       # empty
+  ```
+
+### Rotating the DB password without a restart
+
+```bash
+npm run db:up            # Postgres up, secrets/db_password prepared and aligned
+npm start                 # in another terminal
+curl -s localhost:3000/health   # {"status":"ok","uptimeSec":...} — note the uptime
+npm run db:rotate         # = bash rotate.sh
+curl -s localhost:3000/health   # still "ok", uptimeSec is HIGHER — same process
+```
+
+`rotate.sh`, in order: `ALTER ROLE app_user` in Postgres → overwrite
+`secrets/db_password` → `pg_terminate_backend` on `app_user`'s existing
+connections. The pool's `'error'` listener absorbs the connections that just
+got killed (Postgres emits that as an admin-shutdown error, not a crash) and
+reopens new ones — which read the now-current password from the file.
+
+If you ever run `docker compose down -v` (drops the Postgres volume, so it
+reinitializes with `init.sql`'s original password) while
+`secrets/db_password` still holds a rotated value, just re-run
+`npm run db:up` — it re-aligns the role's password with whatever the file
+currently has, in either direction, so you never have to remember which one
+is stale.
+
+### Bonus challenge — not attempted
+
+Infisical wasn't set up for this HW; the file-based secret above is where
+this submission stops.
 
 ## Verification (acceptance criteria)
 
