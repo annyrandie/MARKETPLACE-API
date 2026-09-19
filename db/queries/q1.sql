@@ -1,0 +1,1 @@
+SELECT id, status, total_amount, created_at FROM orders WHERE user_id = 4242 AND created_at >= now() - interval '365 days' ORDER BY created_at DESC LIMIT 20

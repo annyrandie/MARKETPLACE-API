@@ -4,7 +4,22 @@ Course project HW #9: a contract (`openapi/openapi.yaml`) plus a working
 boundary that actually enforces it. HW #11 adds the configuration skeleton
 underneath it: `process.env` → zod schema (fail-fast) → typed config → code,
 and a DB password that lives in a file and rotates without a restart. See
-[Configuration](#configuration) below.
+[Configuration](#configuration) below. HW #12 adds the data layer under
+*that*: schema, seed, four slow queries proven slow and then proven fixed
+under real volume, and full-text search. See [Data layer](#data-layer-hw-12)
+below.
+
+## Quickstart for the grader
+
+Works on a bare `git clone` — no `.env`, no file edits.
+
+Bring up the database:
+
+    docker compose up -d --wait
+
+Connect:
+
+    docker compose exec db psql -U admin -d marketplace
 
 **Chosen variant — B: runtime validation at the boundary.**
 `app.js` is an Express server where `express-openapi-validator` validates
@@ -29,6 +44,11 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `docker-compose.yml` | Postgres for local runs and the rotation demo |
 | `Dockerfile` + `.dockerignore` | app image with no secrets in any layer |
 | `init.sql` | creates `app_user`, the role the app connects as |
+| `db/schema.sql` | 4 tables, 3 FKs, `numeric` for money, generated `tsvector` column |
+| `db/seed.sql` | ≥100k skewed rows per table that needs it, ends in `VACUUM (ANALYZE)` |
+| `db/queries/q1–q4.sql` | one real slow query each, one statement per file |
+| `db/indexes.sql` | the minimal index set that fixes all four |
+| `db/OPTIMIZATIONS.md` | EXPLAIN before/after for all four + morphology + tsvector cost |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -69,13 +89,13 @@ process start — see [Fail-fast](#fail-fast-not-fail-late) below. The rest of
 the code reads a single typed, frozen `env` object; nothing else in `app.js`
 touches `process.env` directly.
 
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `PORT` | no | `3000` | HTTP server port |
-| `DB_URL` | **yes** | — | Postgres connection string, **without** a password (`postgres://app_user@127.0.0.1:5433/marketplace`) |
-| `DB_PASSWORD_FILE` | no | `secrets/db_password` | path to the file holding the current DB password |
-| `LOG_LEVEL` | no | `info` | `debug` \| `info` \| `warn` \| `error` |
-| `TIMEOUT_MS` | no | `5000` | Postgres connection timeout, ms |
+| Variable | Required | Default | Source | Purpose |
+|---|---|---|---|---|
+| `PORT` | no | `3000` | `.env.example` | HTTP server port |
+| `DB_URL` | **yes** | — | **secret store** — `.env` locally (HW #11), a secrets manager in prod; `.env.example` only holds the fake local-dev shape | Postgres connection string, **without** a password (`postgres://app_user@127.0.0.1:5433/marketplace`) |
+| `DB_PASSWORD_FILE` | no | `secrets/db_password` | `.env.example` | path to the file holding the current DB password |
+| `LOG_LEVEL` | no | `info` | `.env.example` | `debug` \| `info` \| `warn` \| `error` |
+| `TIMEOUT_MS` | no | `5000` | `.env.example` | Postgres connection timeout, ms |
 
 The DB password is deliberately **not** one of these variables — see
 [Secrets](#secrets) below for why.
@@ -168,6 +188,55 @@ is stale.
 
 Infisical wasn't set up for this HW; the file-based secret above is where
 this submission stops.
+
+## Data layer (HW #12)
+
+**Main table:** `orders` (≥100 000 rows). **Table `q4` searches:** `products`
+(also ≥100 000 rows — two different tables, so both counts apply
+separately). Same Postgres as HW #11 — `db/`, `init.sql`, and
+`docker-compose.yml`'s `db` service are the one and only database; `DB_URL`
+in `.env` already points at it (`postgres://app_user@127.0.0.1:5433/marketplace`),
+so there's no second connection string and no new env file for this HW.
+
+Full pipeline, in the order the grader runs it (`db/` is mounted read-only
+into the container at `/db`):
+
+```bash
+docker compose up -d --wait
+
+docker compose exec -T db psql -U admin -d marketplace -v ON_ERROR_STOP=1 -f /db/schema.sql
+docker compose exec -T db psql -U admin -d marketplace -v ON_ERROR_STOP=1 -f /db/seed.sql
+
+# before indexes — every one of these four shows a Seq Scan
+for q in q1 q2 q3 q4; do
+  docker compose exec -T db psql -U admin -d marketplace \
+    -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/$q.sql)"
+done
+
+docker compose exec -T db psql -U admin -d marketplace -v ON_ERROR_STOP=1 -f /db/indexes.sql
+docker compose exec -T db psql -U admin -d marketplace -c "ANALYZE;"
+
+# after indexes — no Seq Scan; q4 is cold on its first run, run it 2–3×
+# and read the last one
+for q in q1 q2 q3 q4; do
+  docker compose exec -T db psql -U admin -d marketplace \
+    -c "EXPLAIN (ANALYZE, BUFFERS) $(cat db/queries/$q.sql)"
+done
+```
+
+Full before/after `EXPLAIN` output for all four queries, the four-index
+inventory (with sizes and why each is partial/expression/GIN), the
+morphology finding, and the measured cost of the generated `search_vector`
+column all live in **`db/OPTIMIZATIONS.md`** — that file is the actual
+report; this section is just how to reproduce it.
+
+**Credentials, on purpose two different ones:** `admin` /
+`admin-bootstrap-only` (hardcoded in `docker-compose.yml`, not a secret) is
+what every command above uses — it's how anyone with a bare clone gets in,
+including the grader. `app_user`, authenticated via the rotating
+`secrets/db_password` file, is what `app.js` connects as — that credential
+is deliberately not reachable from a fresh clone (see
+[Secrets](#secrets) above). Two paths for two different consumers.
 
 ## Verification (acceptance criteria)
 
