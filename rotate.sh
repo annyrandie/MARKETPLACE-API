@@ -22,11 +22,19 @@ docker compose exec -T db psql -U admin -d marketplace \
   -c "ALTER ROLE app_user WITH PASSWORD '${NEW_PASSWORD}';" >/dev/null
 
 echo "2. Updating the secret file…"
-printf '%s' "${NEW_PASSWORD}" > secrets/db_password
+# Atomic: write to a temp file, then rename. `>` alone truncates in place —
+# a connection reading the file at the exact wrong moment would see a
+# partial (possibly empty) password. `mv` on the same filesystem is a single
+# atomic rename, so a reader always sees either the whole old file or the
+# whole new one, never something in between.
+printf '%s' "${NEW_PASSWORD}" > secrets/db_password.tmp
+mv secrets/db_password.tmp secrets/db_password
 
 echo "3. Closing app_user's old connections…"
 docker compose exec -T db psql -U admin -d marketplace -tA \
   -c "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = 'app_user';"
 
+[ -f .env ] && source .env
+
 echo "Done: new password ${NEW_PASSWORD:0:6}… is now in both the DB and the file."
-echo "The app did NOT restart — check: curl -s localhost:3000/health"
+echo "The app did NOT restart — check: curl -s localhost:${PORT:-3000}/health"

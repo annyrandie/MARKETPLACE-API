@@ -8,15 +8,28 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+if [ ! -f .env ]; then
+  echo "✗ .env not found — run: cp .env.example .env" >&2
+  exit 1
+fi
+set -a
+source .env
+set +a
+
 mkdir -p secrets
 [ -f secrets/db_password ] || printf 'marketplace-v1-password' > secrets/db_password
+
+# The compose port mapping and the app's DB_URL must agree — derive one from
+# the other instead of hardcoding the port a second time here.
+DB_HOST_PORT="$(node -e "console.log(new URL(process.env.DB_URL).port || 5432)")"
+export DB_HOST_PORT
 
 docker compose up -d --wait
 docker compose exec -T db psql -U admin -d marketplace \
   -c "ALTER ROLE app_user WITH PASSWORD '$(cat secrets/db_password)';" >/dev/null
 
-echo "Postgres is ready on :5433. Now, in another terminal:"
-echo "  npm start                 # app on :3000"
-echo "  curl -s localhost:3000/health"
+echo "Postgres is ready on :${DB_HOST_PORT}. Now, in another terminal:"
+echo "  npm start                 # app on :${PORT:-3000}"
+echo "  curl -s localhost:${PORT:-3000}/health"
 echo "  bash rotate.sh             # rotate the password"
-echo "  curl -s localhost:3000/health   # still works, same process, higher uptime"
+echo "  curl -s localhost:${PORT:-3000}/health   # still works, same process, higher uptime"

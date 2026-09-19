@@ -4,5 +4,8 @@ spec.json
 .env
 .env.*
 !.env.example
-secrets/db_password
+# `secrets/*` (not `secrets/`) so the !negation below still works — git
+# doesn't descend into an already-excluded directory to re-include a file.
+secrets/*
+!secrets/.gitkeep
 .DS_Store
