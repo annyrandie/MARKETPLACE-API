@@ -7,7 +7,9 @@ and a DB password that lives in a file and rotates without a restart. See
 [Configuration](#configuration) below. HW #12 adds the data layer under
 *that*: schema, seed, four slow queries proven slow and then proven fixed
 under real volume, and full-text search. See [Data layer](#data-layer-hw-12)
-below.
+below. HW #13 turns that same design into code: TypeORM entities,
+migrations (`synchronize: false`), a seed, and an N+1 caught in the query
+log and fixed. See [ORM data layer](#orm-data-layer-hw-13) below.
 
 ## Quickstart for the grader
 
@@ -49,6 +51,13 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `db/queries/q1–q4.sql` | one real slow query each, one statement per file |
 | `db/indexes.sql` | the minimal index set that fixes q1–q4, plus 2 FK-support indexes for `order_items` — see below |
 | `db/OPTIMIZATIONS.md` | EXPLAIN before/after for all four + morphology + tsvector cost + the FK-index tradeoff |
+| `src/entities/` | TypeORM entities for the HW #12 schema — columns, relations, `onDelete` |
+| `src/data-source.ts` | `DataSource` (`synchronize: false`) + `QueryCountLogger` — no hardcoded creds |
+| `src/migrations/` | the generated (and hand-fixed) initial migration |
+| `src/seed.ts` | deterministic, idempotent seed for the TypeORM-managed schema |
+| `src/demo-nplus1.ts` | N+1 on `order → items → product`, query counts before/after |
+| `src/report.ts` | revenue-by-product via `createQueryBuilder().getRawMany()` |
+| `scripts/with-secrets.sh` | resolves DB credentials from the HW #11 vault, `exec`s the wrapped command |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -245,6 +254,126 @@ including the grader. `app_user`, authenticated via the rotating
 `secrets/db_password` file, is what `app.js` connects as — that credential
 is deliberately not reachable from a fresh clone (see
 [Secrets](#secrets) above). Two paths for two different consumers.
+
+## ORM data layer (HW #13)
+
+The HW #12 schema, now as code: `src/entities/` (TypeORM entities),
+`src/migrations/` (migrations, `synchronize: false` always), `src/seed.ts`
+(deterministic, idempotent), `src/demo-nplus1.ts` (N+1, caught and fixed),
+`src/report.ts` (an aggregate query `find()` can't express). This is a
+**separate, parallel** implementation of the same design, not a replacement
+for `db/schema.sql` — the migration below creates its own tables from
+scratch on a clean database; it never touches or reuses HW #12's raw-SQL
+artifact.
+
+### ## Grading
+
+```bash
+docker compose up -d --wait
+npm run build
+
+export DB_HOST=127.0.0.1 DB_PORT=5433 DB_USER=admin DB_PASSWORD=admin-bootstrap-only DB_NAME=marketplace
+export SKIP_VAULT=1    # у грейдера немає доступу до сховища
+
+npm run migrate
+npm run migrate:show
+npm run seed
+npm run demo:nplus1
+npm run report
+```
+
+(Port `5433`, not `5432` — this repo's `docker-compose.yml`, unchanged from
+HW #11/#12. `admin` / `admin-bootstrap-only` are the same non-secret dev
+credentials already hardcoded there.)
+
+### Why `scripts/with-secrets.sh` doesn't call Infisical
+
+HW #11's Infisical bonus was never attempted in this project. What HW #11
+*did* build is a real, working secret store — file-based:
+`secrets/db_password` (gitignored, rotates without a restart — see
+[Secrets](#secrets)) plus the connection shape in `.env`'s `DB_URL`
+(deliberately password-less). `scripts/with-secrets.sh` plays the exact
+role an `infisical run` wrapper would: resolve secrets, export them as env
+vars, `exec` the wrapped command — same contract, same
+`SKIP_VAULT=1 → exec "$@"` escape hatch inserted at the position the
+assignment specifies, different backing store. Every npm script that
+touches the database (`migrate`, `migrate:show`, `migrate:revert`,
+`migrate:generate`, `seed`, `demo:nplus1`, `report`) is wrapped, so they're
+called unprefixed — `npm run migrate`, not
+`bash scripts/with-secrets.sh dev npm run migrate`.
+
+One real, load-bearing fix this required: `app_user` (the role the vault
+path connects as) could `CONNECT` but, on Postgres 16, could not
+`CREATE TABLE` — Postgres 15+ stopped granting `CREATE` on the `public`
+schema to `PUBLIC` by default. `npm run migrate` through the actual vault
+path failed with `permission denied for schema public` until `init.sql`
+got one added line: `GRANT CREATE ON SCHEMA public TO app_user;`. Caught by
+actually running the vault path locally, not assumed to work.
+
+### N+1 — proven, then fixed, on `order → items → product` (two relation levels)
+
+`npm run demo:nplus1`, measured with the SQL query logger
+(`QueryCountLogger` in `src/data-source.ts` — the only tool that actually
+shows N+1; it's invisible in the TypeScript):
+
+| Strategy | Queries (10 orders) | Queries (100 orders) |
+|---|---|---|
+| Naive — `find()` + a query per order for its items, + a query per item for its product | 51 | 321 |
+| `relations: { items: { product: true } }` (LEFT JOIN) | 1 | 1 |
+| `relationLoadStrategy: 'query'` (no JOIN, still not N+1) | 5 | 5 |
+
+The naive count **grows with N** (51 → 321 going from 10 to 100 orders,
+confirmed by actually reseeding 90 extra orders and rerunning, not just
+asserted); the query-strategy count is a **constant** — `1 + 2×levels`
+with 2 relation levels (`items`, then `items.product`) is `1 + 2×2 = 5`,
+matching the assignment's own formula exactly. `relations` alone (a single
+LEFT JOIN) beats both when row multiplication isn't a concern; `query`
+strategy earns its keep when a JOIN would multiply rows badly (one order ×
+many items).
+
+### Repository vs QueryBuilder
+
+`find()`/`Repository` covers "give me entities that exist, optionally with
+their relations" — CRUD and graph loading, the large majority of this
+project's actual queries (seed, N+1 demo, anything shaped like "get me an
+`Order` and its stuff"). The line gets crossed the moment the result isn't
+an entity anymore — an aggregate, a `GROUP BY`, a computed column across a
+join (`src/report.ts`'s revenue-by-product: `SUM(...)`, `GROUP BY p.id`,
+raw rows back, not `Product` instances). `find()` has no vocabulary for
+that at all; `createQueryBuilder().getRawMany()` is the only correct tool,
+not a stylistic alternative.
+
+### `onDelete` choices
+
+Two distinct strategies, three FKs, each a deliberate call:
+
+- `OrderItem.order` → `orders` — **CASCADE**. A deleted order's line items
+  describe nothing on their own; they have no independent meaning.
+- `OrderItem.product` → `products` — **RESTRICT**. A product referenced by
+  real sales history must not disappear out from under it.
+- `Order.user` → `users` — **RESTRICT**. Order history must survive even if
+  the placing user's account is later deleted — the same "history over
+  convenience" call `db/schema.sql` (HW #12) makes structurally by leaving
+  that FK's `ON DELETE` unspecified (Postgres's default, `NO ACTION`,
+  behaves like `RESTRICT` here).
+
+### Two decisions worth naming explicitly
+
+- **Money: `integer` minor units here, `numeric(10,2)` in `db/schema.sql`.**
+  Two different, both legitimate choices in two parallel artifacts of the
+  same design — `numeric` is exact decimal (not float, HW #12's own
+  instruction), integer cents is *this* HW's own explicit instruction.
+  Neither is wrong; they just don't have to match byte-for-byte since this
+  ORM layer builds its own schema from scratch rather than reusing #12's.
+- **`search_vector` needed hand-editing the generated migration.**
+  `migration:generate` has no idea a `tsvector` column is supposed to be a
+  Postgres `GENERATED ALWAYS AS (...) STORED` expression — TypeORM's
+  `@Column` decorator can't express that. The entity declares the column
+  read-only (`select/insert/update: false`); the actual `GENERATED ALWAYS
+  AS (to_tsvector('simple', name || ' ' || description)) STORED` clause and
+  its `GIN` index were added by hand in
+  `src/migrations/…-InitSchema.ts`, matching `db/schema.sql`'s design from
+  HW #12 — see that migration file's own header comment.
 
 ## Verification (acceptance criteria)
 
