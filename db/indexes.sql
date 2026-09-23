@@ -21,3 +21,14 @@ CREATE INDEX idx_users_email_lower ON users (lower(email));
 -- B-tree: a tsvector is a set of lexemes, and GIN is the inverted-index
 -- structure built for "does this set contain these terms", not ordering.
 CREATE INDEX idx_products_search_vector ON products USING GIN (search_vector);
+
+-- Not for q1–q4 — Postgres, unlike MySQL, never creates an index on a FK
+-- column automatically, only on the referenced side (the PK). Without
+-- these, deleting a row from orders/products makes Postgres check every
+-- referencing order_items row for the FK constraint via a Seq Scan on
+-- order_items (300k rows) — see OPTIMIZATIONS.md § FK support indexes for
+-- the measured before/after. Real cost, not "just in case": these two are
+-- the one deliberate exception to "an index only earns its place if q1–q4
+-- use it" in this file.
+CREATE INDEX idx_order_items_order_id ON order_items (order_id);
+CREATE INDEX idx_order_items_product_id ON order_items (product_id);

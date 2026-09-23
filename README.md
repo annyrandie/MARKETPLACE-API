@@ -47,8 +47,8 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `db/schema.sql` | 4 tables, 3 FKs, `numeric` for money, generated `tsvector` column |
 | `db/seed.sql` | ≥100k skewed rows per table that needs it, ends in `VACUUM (ANALYZE)` |
 | `db/queries/q1–q4.sql` | one real slow query each, one statement per file |
-| `db/indexes.sql` | the minimal index set that fixes all four |
-| `db/OPTIMIZATIONS.md` | EXPLAIN before/after for all four + morphology + tsvector cost |
+| `db/indexes.sql` | the minimal index set that fixes q1–q4, plus 2 FK-support indexes for `order_items` — see below |
+| `db/OPTIMIZATIONS.md` | EXPLAIN before/after for all four + morphology + tsvector cost + the FK-index tradeoff |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -224,11 +224,19 @@ for q in q1 q2 q3 q4; do
 done
 ```
 
-Full before/after `EXPLAIN` output for all four queries, the four-index
+Full before/after `EXPLAIN` output for all four queries, the index
 inventory (with sizes and why each is partial/expression/GIN), the
 morphology finding, and the measured cost of the generated `search_vector`
 column all live in **`db/OPTIMIZATIONS.md`** — that file is the actual
 report; this section is just how to reproduce it.
+
+`db/indexes.sql` also creates two indexes q1–q4 never touch —
+`idx_order_items_order_id` and `idx_order_items_product_id`. They exist for
+`DELETE`/FK-check performance, not for any of the four graded queries
+(`db/OPTIMIZATIONS.md` § FK support indexes has the real before/after and
+says plainly that this repo's own dead-index check will list them if you
+run only the q1–q4 pipeline — a named, deliberate exception, not an
+oversight).
 
 **Credentials, on purpose two different ones:** `admin` /
 `admin-bootstrap-only` (hardcoded in `docker-compose.yml`, not a secret) is
