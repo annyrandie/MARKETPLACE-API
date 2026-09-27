@@ -1,7 +1,7 @@
 {
   "name": "marketplace-api",
   "version": "1.0.0",
-  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets: zod fail-fast, file-based DB password rotation (HW #11)",
+  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer: entities, migrations, N+1 demo (HW #13)",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
@@ -12,6 +12,15 @@
     "db:down": "docker compose down -v",
     "lint:spec": "redocly lint openapi/openapi.yaml",
     "bundle:spec": "redocly bundle openapi/openapi.yaml -o spec.json",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "migrate": "bash scripts/with-secrets.sh dev npx typeorm migration:run -d dist/data-source.js",
+    "migrate:show": "bash scripts/with-secrets.sh dev npx typeorm migration:show -d dist/data-source.js",
+    "migrate:revert": "bash scripts/with-secrets.sh dev npx typeorm migration:revert -d dist/data-source.js",
+    "migrate:generate": "bash scripts/with-secrets.sh dev npx typeorm migration:generate -d dist/data-source.js",
+    "seed": "bash scripts/with-secrets.sh dev node dist/seed.js",
+    "demo:nplus1": "bash scripts/with-secrets.sh dev node dist/demo-nplus1.js",
+    "report": "bash scripts/with-secrets.sh dev node dist/report.js",
     "test": "echo \"no automated tests for variant B — see README, Verification section\" && exit 0"
   },
   "keywords": [],
@@ -22,9 +31,14 @@
     "express": "^4.22.2",
     "express-openapi-validator": "^5.6.2",
     "pg": "^8.22.0",
+    "reflect-metadata": "^0.2.2",
+    "typeorm": "^0.3.31",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@redocly/cli": "^2.46.0"
+    "@redocly/cli": "^2.46.0",
+    "@types/node": "^22.20.4",
+    "@types/pg": "^8.23.1",
+    "typescript": "^6.0.3"
   }
 }
