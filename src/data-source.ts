@@ -11,6 +11,7 @@ import { User } from './entities/user.entity';
 import { Product } from './entities/product.entity';
 import { Order } from './entities/order.entity';
 import { OrderItem } from './entities/order-item.entity';
+import { Task } from './entities/task.entity';
 
 // Counts real SQL round-trips — the one tool that actually shows N+1
 // (it never shows up by reading the TypeScript, only in the query log).
@@ -59,10 +60,15 @@ const AppDataSource = new DataSource({
   username: process.env.DB_USER, // pg's own driver wants `user`; TypeORM's option is `username`
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  entities: [User, Product, Order, OrderItem],
+  entities: [User, Product, Order, OrderItem, Task],
   migrations: ['dist/migrations/*.js'],
   synchronize: false, // schema comes from migrations, never from entity metadata at runtime
   logger,
+  // HW #14's demo:race opens 50+ concurrent checkout() calls — each one is
+  // its own connection for the duration of its transaction. Below this, the
+  // rest just queue politely inside the pool (harmless, per the assignment's
+  // own hint), but raising it keeps the demo's wall-clock time honest.
+  extra: { max: 30 },
 });
 
 export default AppDataSource;

@@ -1,7 +1,7 @@
 {
   "name": "marketplace-api",
   "version": "1.0.0",
-  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer: entities, migrations, N+1 demo (HW #13)",
+  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14)",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
@@ -21,6 +21,9 @@
     "seed": "bash scripts/with-secrets.sh dev node dist/seed.js",
     "demo:nplus1": "bash scripts/with-secrets.sh dev node dist/demo-nplus1.js",
     "report": "bash scripts/with-secrets.sh dev node dist/report.js",
+    "demo:race": "bash scripts/with-secrets.sh dev node dist/demo-race.js",
+    "demo:workers": "bash scripts/with-secrets.sh dev node dist/demo-workers.js",
+    "demo:retry": "bash scripts/with-secrets.sh dev node dist/demo-retry.js",
     "test": "echo \"no automated tests for variant B — see README, Verification section\" && exit 0"
   },
   "keywords": [],
