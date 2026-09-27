@@ -266,7 +266,7 @@ for `db/schema.sql` — the migration below creates its own tables from
 scratch on a clean database; it never touches or reuses HW #12's raw-SQL
 artifact.
 
-### ## Grading
+## Grading
 
 ```bash
 docker compose up -d --wait
@@ -342,6 +342,13 @@ join (`src/report.ts`'s revenue-by-product: `SUM(...)`, `GROUP BY p.id`,
 raw rows back, not `Product` instances). `find()` has no vocabulary for
 that at all; `createQueryBuilder().getRawMany()` is the only correct tool,
 not a stylistic alternative.
+
+Worth getting right even inside the QueryBuilder version: the report
+`leftJoin`s `order_items` and wraps both aggregates in `COALESCE(..., 0)`,
+not `innerJoin` + bare `SUM`. A product with zero sales has to show up as a
+`0` row — `innerJoin` would drop it from the result set entirely, which
+reads as "this product doesn't exist" to anyone consuming the report, not
+"exists, sold nothing".
 
 ### `onDelete` choices
 

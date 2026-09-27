@@ -1,8 +1,10 @@
 // Deterministic, idempotent seed. Users/products are upserted by their
-// natural key (email / name) — running this twice never duplicates them.
-// Orders are guarded by a single count() check: once any exist, the second
-// run skips order creation entirely rather than trying to figure out which
-// of 10 specific orders are "new".
+// natural key (email / name). Orders have no natural business key of their
+// own, so their natural key is their full composition — which user, and
+// exactly which (product, quantity) line items — checked and restored one
+// order at a time, not behind a single all-or-nothing count() guard: if
+// someone deletes a subset of the seed orders, a re-run puts back exactly
+// the missing ones instead of seeing "orders exist" and skipping everyone.
 import 'reflect-metadata';
 import AppDataSource, { logger } from './data-source';
 import { User } from './entities/user.entity';
@@ -29,6 +31,22 @@ const PRODUCTS = [
 
 const ORDER_STATUSES: OrderStatus[] = ['completed', 'completed', 'pending', 'completed', 'cancelled'];
 
+interface ItemSpec {
+  productId: string;
+  quantity: number;
+}
+
+/** A seed order's natural key: user + the exact multiset of (product,
+ *  quantity) pairs on it, order-independent (sorted) so item array order
+ *  never matters. */
+function orderKey(userId: string, items: ItemSpec[]): string {
+  const itemsPart = items
+    .map((it) => `${it.productId}:${it.quantity}`)
+    .sort()
+    .join('|');
+  return `${userId}::${itemsPart}`;
+}
+
 async function main(): Promise<void> {
   await AppDataSource.initialize();
   logger.echo = false;
@@ -50,35 +68,46 @@ async function main(): Promise<void> {
   }
 
   const orderRepo = AppDataSource.getRepository(Order);
-  const existingOrders = await orderRepo.count();
+  const existing = await orderRepo.find({ relations: { user: true, items: { product: true } } });
+  const existingKeys = new Set(
+    existing.map((o) => orderKey(o.user.id, o.items.map((it) => ({ productId: it.product.id, quantity: it.quantity })))),
+  );
 
-  if (existingOrders === 0) {
-    const orders: Order[] = [];
-    for (let i = 0; i < 10; i++) {
-      const a = products[i % products.length];
-      const b = products[(i + 2) % products.length];
+  const newOrders: Order[] = [];
+  for (let i = 0; i < 10; i++) {
+    const a = products[i % products.length];
+    const b = products[(i + 2) % products.length];
+    const user = users[i % users.length];
+    const itemSpecs: ItemSpec[] = [
+      { productId: a.id, quantity: (i % 3) + 1 },
+      { productId: b.id, quantity: 1 },
+    ];
 
-      const itemA = new OrderItem();
-      itemA.product = a;
-      itemA.quantity = (i % 3) + 1;
-      itemA.unitPriceCents = a.priceCents;
+    if (existingKeys.has(orderKey(user.id, itemSpecs))) continue; // this exact seed order is already there
 
-      const itemB = new OrderItem();
-      itemB.product = b;
-      itemB.quantity = 1;
-      itemB.unitPriceCents = b.priceCents;
+    const itemA = new OrderItem();
+    itemA.product = a;
+    itemA.quantity = itemSpecs[0].quantity;
+    itemA.unitPriceCents = a.priceCents;
 
-      const order = new Order();
-      order.user = users[i % users.length];
-      order.status = ORDER_STATUSES[i % ORDER_STATUSES.length];
-      order.items = [itemA, itemB];
-      order.totalAmountCents = itemA.quantity * itemA.unitPriceCents + itemB.quantity * itemB.unitPriceCents;
-      orders.push(order);
-    }
-    await orderRepo.save(orders); // cascade: true on Order.items — inserts orders + order_items in one call
-    console.log(`Seeded ${orders.length} orders.`);
+    const itemB = new OrderItem();
+    itemB.product = b;
+    itemB.quantity = itemSpecs[1].quantity;
+    itemB.unitPriceCents = b.priceCents;
+
+    const order = new Order();
+    order.user = user;
+    order.status = ORDER_STATUSES[i % ORDER_STATUSES.length];
+    order.items = [itemA, itemB];
+    order.totalAmountCents = itemA.quantity * itemA.unitPriceCents + itemB.quantity * itemB.unitPriceCents;
+    newOrders.push(order);
+  }
+
+  if (newOrders.length > 0) {
+    await orderRepo.save(newOrders); // cascade: true on Order.items — inserts orders + order_items in one call
+    console.log(`Seeded ${newOrders.length} order(s) (${existing.length} already present).`);
   } else {
-    console.log(`Orders already seeded (${existingOrders} found) — skipping.`);
+    console.log(`All 10 seed orders already present (${existing.length} found) — skipping.`);
   }
 
   const counts = {

@@ -19,10 +19,15 @@ async function main(): Promise<void> {
 
   const report = await AppDataSource.getRepository(Product)
     .createQueryBuilder('p')
-    .innerJoin('order_items', 'oi', 'oi.product_id = p.id')
+    // leftJoin, not innerJoin: a product nobody has ever ordered still
+    // belongs in a revenue-by-product report — as a 0 row, not as a
+    // silently missing one. innerJoin would drop it from the result
+    // entirely, which looks like "this product doesn't exist" rather than
+    // "this product has no sales".
+    .leftJoin('order_items', 'oi', 'oi.product_id = p.id')
     .select('p.name', 'name')
-    .addSelect('SUM(oi.quantity)', 'units')
-    .addSelect('SUM(oi.quantity * oi.unit_price_cents)', 'revenue_cents')
+    .addSelect('COALESCE(SUM(oi.quantity), 0)', 'units')
+    .addSelect('COALESCE(SUM(oi.quantity * oi.unit_price_cents), 0)', 'revenue_cents')
     .groupBy('p.id')
     .addGroupBy('p.name')
     .orderBy('revenue_cents', 'DESC')
