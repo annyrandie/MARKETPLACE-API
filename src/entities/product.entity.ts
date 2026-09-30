@@ -21,6 +21,12 @@ export class Product {
   @Column({ type: 'int', name: 'price_cents' })
   priceCents: number;
 
+  // HW #14: checkout decrements this atomically (`UPDATE ... WHERE stock >=
+  // $n RETURNING`, see src/checkout.ts) — never read-then-written from app
+  // code, which is what actually prevents oversell under concurrency.
+  @Column({ type: 'int', name: 'stock', default: 0 })
+  stock: number;
+
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
   createdAt: Date;
 

@@ -9,7 +9,11 @@ and a DB password that lives in a file and rotates without a restart. See
 under real volume, and full-text search. See [Data layer](#data-layer-hw-12)
 below. HW #13 turns that same design into code: TypeORM entities,
 migrations (`synchronize: false`), a seed, and an N+1 caught in the query
-log and fixed. See [ORM data layer](#orm-data-layer-hw-13) below.
+log and fixed. See [ORM data layer](#orm-data-layer-hw-13) below. HW #14
+puts real concurrency on top of it: a transactional checkout that survives
+50+ simultaneous buyers without overselling, a `FOR UPDATE SKIP LOCKED`
+worker pool, and a retry wrapper that catches an actual, provoked `40001`.
+See [Concurrency](#concurrency-hw-14) below.
 
 ## Quickstart for the grader
 
@@ -58,6 +62,13 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `src/demo-nplus1.ts` | N+1 on `order → items → product`, query counts before/after |
 | `src/report.ts` | revenue-by-product via `createQueryBuilder().getRawMany()` |
 | `scripts/with-secrets.sh` | resolves DB credentials from the HW #11 vault, `exec`s the wrapped command |
+| `src/checkout.ts` | transactional checkout: atomic stock/balance decrement, order, queued task |
+| `src/entities/task.entity.ts` | `job_queue` — durable task queue drained via `FOR UPDATE SKIP LOCKED` |
+| `src/migrations/…-CheckoutConcurrency.ts` | adds `stock`, `balance_cents`, `job_queue` |
+| `src/lib/concurrency.ts` | `withRetry` — retries only `40001`/`40P01`, capped backoff |
+| `src/demo-race.ts` | 60 concurrent `checkout()` calls, proves no oversell |
+| `src/demo-workers.ts` | worker pool drains a task batch via SKIP LOCKED |
+| `src/demo-retry.ts` | provokes a real `40001`, proves the retry recovers without a lost update |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -280,6 +291,11 @@ npm run migrate:show
 npm run seed
 npm run demo:nplus1
 npm run report
+
+# HW #14 — concurrency
+npm run demo:race
+npm run demo:workers
+npm run demo:retry
 ```
 
 (Port `5433`, not `5432` — this repo's `docker-compose.yml`, unchanged from
@@ -381,6 +397,104 @@ Two distinct strategies, three FKs, each a deliberate call:
   its `GIN` index were added by hand in
   `src/migrations/…-InitSchema.ts`, matching `db/schema.sql`'s design from
   HW #12 — see that migration file's own header comment.
+
+## Concurrency (HW #14)
+
+`src/checkout.ts` — decrement stock, decrement the buyer's balance, insert
+the order, queue a post-processing task, one transaction
+(`AppDataSource.transaction(...)`, one connection for the whole thing, not
+`pool.query('BEGIN')` on a shared pool). Either everything commits or
+nothing does — no orphaned orders, no order that exists without stock
+actually having been taken.
+
+### Pessimistic lock vs atomic `UPDATE ... RETURNING`
+
+Went with the atomic `UPDATE products SET stock = stock - $1 WHERE id = $2
+AND stock >= $1 RETURNING price_cents` — not `SELECT ... FOR UPDATE` then a
+second `UPDATE`. Both are race-free (`FOR UPDATE` blocks a second
+transaction on the same row exactly like the atomic `UPDATE`'s row lock
+does); the difference is where the decision lives. The atomic form makes
+the check *and* the write the same statement — there is no read step in
+application code between them for a bug to insert a bad decision into.
+`SELECT ... FOR UPDATE` still requires reading a value into JS, deciding,
+and issuing a second statement — get that ordering wrong even slightly
+(skip re-reading after the lock, cache the value, decide from stale state)
+and it's the exact read-modify-write anti-pattern this whole assignment
+exists to rule out. One round trip instead of two is a genuine bonus, but
+not the reason for the choice.
+
+### `npm run demo:race` — 60 concurrent checkouts, stock=10
+
+```
+Attempts: 60
+Succeeded: 10
+Failed (out of stock): 50
+Final stock: 0
+Rows with negative stock (any product): 0
+Elapsed: 56 ms
+✓ No oversell
+```
+
+Exactly 10 succeed — no more, no fewer — regardless of the fact that all 60
+`checkout()` calls fire at once via a bare `Promise.all` (each call catches
+its own rejection so one failure can't short-circuit the batch before the
+rest settle). Every rejection is a real, correct `InsufficientStockError`,
+not a crash or a corrupted row.
+
+### `npm run demo:workers` — SKIP LOCKED task queue, 4 workers
+
+```
+Seeded 40 tasks, 30ms of simulated work each.
+Ideal parallel time: 300ms · sequential: 1200ms
+Distribution: worker-1=10, worker-2=10, worker-3=10, worker-4=10
+Processed twice (or not exactly once): 0
+Elapsed: 354ms (sequential estimate: 1200ms)
+✓ Every task processed exactly once
+```
+
+A perfectly even 10/10/10/10 split and 354 ms against a 1200 ms sequential
+baseline (close to the 300 ms parallel ideal) — `FOR UPDATE SKIP LOCKED`
+means a worker that finds every unclaimed row already locked moves on to
+the next one instead of queueing behind it, so no two workers can ever
+claim the same task. A worker seeing zero rows re-checks whether the queue
+is *actually* empty before stopping — "nothing free right now" and "queue
+drained" are different states, and stopping on the first one would abandon
+tasks other workers just haven't gotten to yet.
+
+### `npm run demo:retry` — provoked 40001, 10 concurrent writers
+
+```
+Conflicts caught and retried (40001/40P01): 45
+Final stock: 10 (expected: 10)
+Elapsed: 2760ms
+✓ 45 conflict(s) recovered via retry, final state arithmetically correct
+```
+
+10 transactions under `REPEATABLE READ` each `SELECT` the same row, sleep
+60ms (deliberately widening the read/write window so they collide), then
+`UPDATE` from what they read — the read-modify-write-in-JS pattern
+`checkout.ts` avoids everywhere else, done here on purpose to provoke
+`could not serialize access due to concurrent update` (`40001`). 45
+conflicts were caught and retried across the 10 writers (a conflict can
+itself collide with another retry — contention cascades, which is why
+`withRetry`'s backoff is capped rather than left to grow unbounded); final
+stock lands on exactly 10, proving no update was silently lost to a retry
+that only re-ran the write instead of the whole transaction.
+
+### Why retry only catches `40001` and `40P01`
+
+`40001` (`serialization_failure`) and `40P01` (`deadlock_detected`) are
+Postgres's two explicit "this transaction did nothing — the state is exactly
+as if it had never run, and you should try the whole thing again" signals.
+That's a very narrow, very safe class to blanket-retry: nothing partial
+happened, so replaying the entire transaction (reads included) can't
+duplicate an effect or skip one. Any other error — a constraint violation,
+`InsufficientStockError`/`InsufficientBalanceError`, a genuine bug, a
+connection drop — means something else entirely happened (or the caller's
+own business rule correctly rejected the request), and blindly retrying
+those would either loop on a request that can never succeed or, worse, risk
+side effects an idempotency key isn't protecting here. Retrying "the DB
+asked us to" is safe; retrying "something failed" is not.
 
 ## Verification (acceptance criteria)
 

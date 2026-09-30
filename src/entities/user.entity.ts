@@ -15,6 +15,11 @@ export class User {
   @Column({ type: 'varchar', length: 200, name: 'full_name' })
   fullName: string;
 
+  // HW #14: checkout decrements this atomically, same pattern as
+  // Product.stock — see src/checkout.ts.
+  @Column({ type: 'int', name: 'balance_cents', default: 0 })
+  balanceCents: number;
+
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
   createdAt: Date;
 
