@@ -20,15 +20,19 @@ mkdir -p secrets
 [ -f secrets/db_password ] || printf 'marketplace-v1-password' > secrets/db_password
 
 # The compose port mapping and the app's DB_URL must agree — derive one from
-# the other instead of hardcoding the port a second time here.
-DB_HOST_PORT="$(node -e "console.log(new URL(process.env.DB_URL).port || 5432)")"
-export DB_HOST_PORT
+# the other instead of hardcoding the port a second time here. DB_URL now
+# points at PgBouncer (HW #15), not at Postgres directly, so this is
+# PgBouncer's host port, not `db`'s (that one's a fixed dev convenience,
+# hardcoded in docker-compose.yml since nothing derives it anymore).
+PGBOUNCER_HOST_PORT="$(node -e "console.log(new URL(process.env.DB_URL).port || 6432)")"
+export PGBOUNCER_HOST_PORT
 
 docker compose up -d --wait
 docker compose exec -T db psql -U admin -d marketplace \
   -c "ALTER ROLE app_user WITH PASSWORD '$(cat secrets/db_password)';" >/dev/null
 
-echo "Postgres is ready on :${DB_HOST_PORT}. Now, in another terminal:"
+echo "Postgres is ready behind PgBouncer on :${PGBOUNCER_HOST_PORT} (direct Postgres access: :5433)."
+echo "Now, in another terminal:"
 echo "  npm start                 # app on :${PORT:-3000}"
 echo "  curl -s localhost:${PORT:-3000}/health"
 echo "  bash rotate.sh             # rotate the password"

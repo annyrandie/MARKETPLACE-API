@@ -1,13 +1,15 @@
-# Postgres for local development and the password-rotation demo (HW #11).
-# The app itself runs on the host (`npm start`), not as a compose service.
-# DB_HOST_PORT is exported by scripts/up-db.sh, derived from .env's DB_URL —
-# the port lives in one place (DB_URL) instead of being repeated here too.
+# Postgres for local development and the password-rotation demo (HW #11),
+# fronted by PgBouncer (HW #15) — the app talks to `pgbouncer`, never to `db`
+# directly. `db`'s own host port below is a fixed dev convenience (direct
+# psql access), unrelated to .env's DB_URL, which now points at PgBouncer's
+# port instead (see scripts/up-db.sh, derived the same "one place" way
+# DB_HOST_PORT used to be — just aimed at a different service).
 name: marketplace-api
 services:
   db:
     image: postgres:16-alpine
     ports:
-      - '${DB_HOST_PORT:-5433}:5432'
+      - '5433:5432'
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: admin-bootstrap-only # admin for ALTER ROLE; the app never connects as this user
@@ -20,3 +22,46 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    ports:
+      - '${PGBOUNCER_HOST_PORT:-6432}:5432'
+    # The whole directory, not two single-file binds: rotate.sh rewrites
+    # userlist.txt via `sed -i`, which (both GNU and BSD sed) writes a new
+    # file and renames it over the old one — a single-file bind mount keeps
+    # pointing at the now-unlinked original inode, so the container stops
+    # seeing the file at all after the first rotation. A directory mount
+    # follows renames inside it.
+    volumes:
+      - ./pgbouncer:/etc/pgbouncer:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD-SHELL', "PGPASSWORD=admin-bootstrap-only psql -h 127.0.0.1 -p 5432 -U admin -d marketplace -c 'SELECT 1' >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # Clean restore target for scripts/restore-drill.sh (HW #15, step 8 of
+  # lecture 15's ladder). Only comes up with `--profile drill`; the drill
+  # script itself destroys and recreates both this container and its volume
+  # on every run, so a drill never restores into leftover data.
+  restore:
+    image: postgres:16-alpine
+    profiles: ['drill']
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin-bootstrap-only
+      POSTGRES_DB: marketplace
+    volumes:
+      - pgdata-restore:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U admin -d marketplace']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  pgdata-restore:

@@ -34,6 +34,18 @@ echo "3. Closing app_user's old connections…"
 docker compose exec -T db psql -U admin -d marketplace -tA \
   -c "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = 'app_user';"
 
+# HW #15: the app now connects through PgBouncer, which authenticates
+# app_user against its OWN copy of the password in userlist.txt — separate
+# from Postgres's, and not read from secrets/db_password. Skipping this step
+# would leave PgBouncer's copy stale: every NEW backend connection it opens
+# (the very next transaction) fails auth, even though the app itself is
+# happily using the freshly-rotated password from the secret file.
+echo "4. Syncing PgBouncer's userlist.txt and reloading…"
+sed -i.bak "s/^\"app_user\" \".*\"/\"app_user\" \"${NEW_PASSWORD}\"/" pgbouncer/userlist.txt
+rm -f pgbouncer/userlist.txt.bak
+docker compose exec -T pgbouncer env PGPASSWORD=admin-bootstrap-only \
+  psql -h 127.0.0.1 -p 5432 -U admin -d pgbouncer -c "RELOAD;" >/dev/null
+
 [ -f .env ] && source .env
 
 echo "Done: new password ${NEW_PASSWORD:0:6}… is now in both the DB and the file."

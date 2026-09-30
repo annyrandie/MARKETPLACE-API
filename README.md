@@ -13,7 +13,11 @@ log and fixed. See [ORM data layer](#orm-data-layer-hw-13) below. HW #14
 puts real concurrency on top of it: a transactional checkout that survives
 50+ simultaneous buyers without overselling, a `FOR UPDATE SKIP LOCKED`
 worker pool, and a retry wrapper that catches an actual, provoked `40001`.
-See [Concurrency](#concurrency-hw-14) below.
+See [Concurrency](#concurrency-hw-14) below. HW #15 adds two production
+attributes on top of all of that: a connection pooler (PgBouncer, in front
+of Postgres — the app never connects directly anymore) and a backup you've
+actually restored, not just produced. See
+[Data layer ops](#data-layer-ops-hw-15) below.
 
 ## Quickstart for the grader
 
@@ -23,7 +27,11 @@ Bring up the database:
 
     docker compose up -d --wait
 
-Connect:
+Connect (through PgBouncer, the same path the app itself uses since HW #15):
+
+    PGPASSWORD=admin-bootstrap-only psql -h 127.0.0.1 -p 6432 -U admin -d marketplace -c 'SELECT 1'
+
+Direct Postgres access (bypassing the pooler — admin/debugging only):
 
     docker compose exec db psql -U admin -d marketplace
 
@@ -69,6 +77,12 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `src/demo-race.ts` | 60 concurrent `checkout()` calls, proves no oversell |
 | `src/demo-workers.ts` | worker pool drains a task batch via SKIP LOCKED |
 | `src/demo-retry.ts` | provokes a real `40001`, proves the retry recovers without a lost update |
+| `pgbouncer/pgbouncer.ini` | `pool_mode = transaction`, `default_pool_size`, admin console config |
+| `pgbouncer/userlist.txt` | client credentials PgBouncer authenticates against (same dev creds as `docker-compose.yml`/`init.sql`, no new secret) |
+| `scripts/backup.sh` | `pg_dump -Fc`, dated filename, run inside the `db` container (not through the pooler — see below) |
+| `scripts/restore-drill.sh` | restores the latest dump into a disposable clean container, proves a checksum match, self-cleans |
+| `backup.cron` | nightly schedule line for `scripts/backup.sh` |
+| `RESTORE-DRILL.md` | one real drill's record: date, dump size, restore time, RTO/RPO |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -283,7 +297,7 @@ artifact.
 docker compose up -d --wait
 npm run build
 
-export DB_HOST=127.0.0.1 DB_PORT=5433 DB_USER=admin DB_PASSWORD=admin-bootstrap-only DB_NAME=marketplace
+export DB_HOST=127.0.0.1 DB_PORT=6432 DB_USER=admin DB_PASSWORD=admin-bootstrap-only DB_NAME=marketplace
 export SKIP_VAULT=1    # у грейдера немає доступу до сховища
 
 npm run migrate
@@ -296,11 +310,29 @@ npm run report
 npm run demo:race
 npm run demo:workers
 npm run demo:retry
+
+# HW #15 — PgBouncer liveness + pool mode
+psql -h 127.0.0.1 -p 6432 -U app_user -d marketplace -c "SELECT 1"       # PGPASSWORD=marketplace-v1-password
+grep -E '^\s*pool_mode\s*=\s*transaction' pgbouncer/pgbouncer.ini
+psql -h 127.0.0.1 -p 6432 -U admin -d pgbouncer -c "SHOW POOLS"          # PGPASSWORD=admin-bootstrap-only
+
+# HW #15 — backup + restore drill
+bash scripts/with-secrets.sh dev bash scripts/backup.sh
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
+grep -cE '^(@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)|([0-9*/,-]+[[:space:]]+){4}[0-9*/,-]+)[[:space:]]+.*backup' backup.cron
 ```
 
-(Port `5433`, not `5432` — this repo's `docker-compose.yml`, unchanged from
-HW #11/#12. `admin` / `admin-bootstrap-only` are the same non-secret dev
-credentials already hardcoded there.)
+(Port `6432`, not `5433` — every one of the commands above (`migrate`
+through `demo:retry` included) now goes through **PgBouncer**, not directly
+to Postgres; `6432` is PgBouncer's published host port in this repo's
+`docker-compose.yml`, unchanged in spirit from HW #11/#12's direct-port
+convention, just aimed at the pooler since HW #15. Postgres's own port
+(`5433`) is still published too, for direct/admin access — see
+[Data layer ops](#data-layer-ops-hw-15). `admin` / `admin-bootstrap-only`
+and `app_user` / `marketplace-v1-password` are the same non-secret dev
+credentials already hardcoded in `docker-compose.yml` / `init.sql`; PgBouncer
+authenticates against copies of the same values in `pgbouncer/userlist.txt`
+— see that file's own header comment for why plaintext there is fine.)
 
 ### Why `scripts/with-secrets.sh` doesn't call Infisical
 
@@ -495,6 +527,131 @@ own business rule correctly rejected the request), and blindly retrying
 those would either loop on a request that can never succeed or, worse, risk
 side effects an idempotency key isn't protecting here. Retrying "the DB
 asked us to" is safe; retrying "something failed" is not.
+
+## Data layer ops (HW #15)
+
+Two production attributes on top of HW #12–14's schema/ORM/concurrency
+layer: a connection pooler on the DB side, and a backup whose restore has
+actually been tested, once, for real — not just produced and trusted.
+
+### Bringing it up
+
+```bash
+npm run db:up        # docker compose up -d --wait + aligns app_user's password
+npm start            # app on :3000 — connects through PgBouncer, not directly
+```
+
+`docker-compose.yml` now runs three services: `db` (Postgres, unchanged —
+still published on `:5433` for direct/admin access), `pgbouncer` (published
+on `:6432`, `pool_mode = transaction`), and `restore` (profile `drill` only
+— brought up and torn down entirely by `scripts/restore-drill.sh`, never by
+hand). `.env`'s `DB_URL` points at `:6432` now, not `:5433` — that one value
+change is what makes the app, and every `npm run migrate`/`seed`/`demo:*`
+script (all built on the same `src/data-source.ts`), talk to PgBouncer
+instead of Postgres directly. No new secret: PgBouncer authenticates
+against `pgbouncer/userlist.txt`, holding copies of the exact same dev
+credentials `docker-compose.yml`/`init.sql` already define.
+
+### PgBouncer transaction mode: what it breaks
+
+`pool_mode = transaction` is the whole reason a pooler helps here: a client
+holds a "connection" to PgBouncer, but the real Postgres backend connection
+is handed out only for the lifetime of one transaction, then returned to
+the pool — `max_client_conn` clients (200 here) can share
+`default_pool_size` real backend connections (8 here). The cost is that
+nothing tied to a *session* (as opposed to a transaction) survives between
+transactions, because the next one may land on a different backend
+entirely:
+
+- **`SET`/`SET LOCAL` issued outside a transaction.** A bare `SET` sent as
+  its own statement is gone the instant that implicit transaction ends —
+  the next statement may run on a different backend that never saw it.
+  (`SET` *inside* an explicit transaction, like `demo-retry.ts`'s
+  `BEGIN ISOLATION LEVEL REPEATABLE READ`, is fine: the whole transaction
+  is one lease on one backend.)
+- **`LISTEN`/`NOTIFY`.** A `LISTEN` registers interest on whatever backend
+  happens to be holding the connection at that moment — the next
+  transaction can get handed a different backend that was never told to
+  listen for anything.
+- **Session-level advisory locks** (`pg_advisory_lock`, as opposed to the
+  transaction-scoped `pg_advisory_xact_lock`) — same problem: the lock lives
+  on a specific backend session, which transaction pooling doesn't
+  guarantee to keep reserved for that client.
+- **Named/server-side prepared statements.** A driver that prepares a
+  statement by name on one backend and later tries to `EXECUTE` it after
+  landing on a different one gets "prepared statement does not exist".
+  This project's driver (`pg`, via `node-postgres`) doesn't use named
+  prepared statements by default, so nothing here actually hits this —
+  `max_prepared_statements = 200` in `pgbouncer.ini` is headroom per the
+  assignment's own hint (PgBouncer ≥ 1.21 can track and re-prepare them
+  itself), not a fix for an observed failure.
+
+`scripts/backup.sh` deliberately does **not** go through PgBouncer for
+exactly this reason — see that file's own header comment: `pg_dump` issues
+session-level `SET`s before opening its snapshot transaction, and under
+transaction pooling those aren't guaranteed to land on the same backend as
+the dump itself.
+
+### Backup
+
+```bash
+npm run backup
+# Backup created: backups/marketplace_20260930_230705.dump (20K)
+```
+
+`pg_dump -Fc`, run inside the `db` container (`docker compose exec -T db
+pg_dump …`, not via whatever `pg_dump` happens to be on the caller's `PATH`)
+— two independent reasons, both in the script's header comment: version
+skew (a host `pg_dump` can emit an archive format this project's
+`postgres:16` `pg_restore` can't read — hit exactly this locally, fixed by
+dumping with the same image `db` runs) and PgBouncer transaction mode (see
+above). Output goes to `backups/` (gitignored), named
+`<db>_<YYYYMMDD>_<HHMMSS>.dump`. `backup.cron` runs the same script nightly
+through the same `scripts/with-secrets.sh` wrapper a human would use.
+
+### Restore drill
+
+```bash
+npm run restore-drill
+```
+
+Takes the newest file in `backups/`, spins up `restore` (profile `drill`) —
+a `postgres:16-alpine` container on a **volume that did not exist a moment
+ago** — `pg_restore --no-owner --no-acl` into it, then compares
+`count(*) || '|' || sum(price_cents)` on `products` between the live DB
+(read through PgBouncer) and the freshly-restored copy. `--no-acl` alongside
+the assignment's own `--no-owner` hint for the same reason: the dump also
+carries `init.sql`'s `GRANT … TO app_user`, and that role deliberately
+doesn't exist in this disposable target. Prints `MATCH` and exits 0, or
+`MISMATCH`/a restore error and exits non-zero. Self-cleans via a `trap` on
+exit — success or failure — so the container and volume are gone again by
+the time the script returns, and a second run is guaranteed to restore into
+a genuinely empty database, not leftovers from the first. Recorded result
+of one real run: [RESTORE-DRILL.md](RESTORE-DRILL.md).
+
+### Rotation still works with PgBouncer in front
+
+HW #11's `rotate.sh` (zero-downtime password rotation) gained one more step
+because of PgBouncer: PgBouncer authenticates `app_user` against its own
+copy of the password in `pgbouncer/userlist.txt`, separate from Postgres's
+and from `secrets/db_password`. Without syncing it, the rotation would still
+"succeed" in Postgres and in the secret file, but the very next transaction
+PgBouncer opens to the real backend — or the very next client connection
+using the newly-rotated password — would fail to authenticate. `rotate.sh`
+now also rewrites that line and issues `RELOAD` through PgBouncer's admin
+console — proven locally: `npm start`, `bash rotate.sh` mid-request,
+`curl localhost:3000/health` still `200`, same process, same as before HW
+#15 added the pooler in between.
+
+One real, load-bearing fix this required:
+`docker-compose.yml`'s `pgbouncer` service originally bind-mounted
+`pgbouncer.ini`/`userlist.txt` as two individual files. `rotate.sh` editing
+`userlist.txt` via `sed -i` (both GNU and BSD sed rewrite-then-rename rather
+than truly edit in place) silently broke that mount — the container kept
+pointing at the now-unlinked original inode and stopped seeing the file at
+all. Fixed by bind-mounting the whole `pgbouncer/` directory instead, which
+follows renames inside it. Caught by actually rotating twice in a row
+against a live container, not assumed to work from reading the compose file.
 
 ## Verification (acceptance criteria)
 
