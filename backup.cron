@@ -1,0 +1,10 @@
+# Nightly logical backup — RPO of this schedule is "up to 24h of data since
+# the last successful run" (see RESTORE-DRILL.md). Runs the exact same
+# scripts/backup.sh a human runs manually, through the exact same vault
+# wrapper (scripts/with-secrets.sh) — no separate "cron path" to drift from
+# the one that's actually tested.
+#
+# REPO_DIR: replace with the deploy target's checkout path (e.g.
+# /opt/marketplace-api). Not the dev machine's path — this file describes
+# where cron runs in production, which this repo doesn't know.
+0 3 * * * cd REPO_DIR && bash scripts/with-secrets.sh dev bash scripts/backup.sh >> /var/log/marketplace-backup.log 2>&1

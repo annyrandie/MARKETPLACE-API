@@ -11,3 +11,6 @@ spec.json
 secrets/*
 !secrets/.gitkeep
 .DS_Store
+# HW #15: scripts/backup.sh's dump artifacts — reproducible from a live DB,
+# not something to version.
+backups/

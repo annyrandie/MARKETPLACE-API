@@ -1,0 +1,10 @@
+; Plaintext here is fine even with auth_type = scram-sha-256 in pgbouncer.ini
+; — PgBouncer computes the SCRAM proof at auth time from this value, both for
+; the client leg and (using the same value) for its own connection to the
+; real Postgres backend. These are the project's existing non-secret dev
+; credentials, not new ones: "admin" matches docker-compose.yml's
+; POSTGRES_PASSWORD (static, never rotated); "app_user" matches init.sql's
+; bootstrap password / secrets/db_password's starting value (see rotate.sh —
+; rotating it there updates this file too, see its header comment).
+"admin" "admin-bootstrap-only"
+"app_user" "marketplace-v1-password"
