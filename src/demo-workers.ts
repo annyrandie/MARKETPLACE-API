@@ -58,7 +58,15 @@ async function worker(workerId: string, taskIds: string[], counts: Map<string, n
       [taskIds],
     );
     if (Number(remaining[0].count) === 0) return; // actually empty — done
-    if (consecutiveEmpty > 20) return; // safety valve, should never trigger
+    if (consecutiveEmpty > 20) {
+      // Should never trigger — if it does, tasks are still pending but this
+      // worker has given up seeing them (stuck lock, bug, etc). Surfacing
+      // that as a thrown error (not a quiet return) is the whole point: a
+      // silent return here would exit 0 while work is left undone.
+      throw new Error(
+        `${workerId}: gave up after ${consecutiveEmpty} empty polls with pending tasks still remaining`,
+      );
+    }
     await sleep(10);
   }
 }

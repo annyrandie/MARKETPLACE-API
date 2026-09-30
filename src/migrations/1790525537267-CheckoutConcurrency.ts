@@ -34,7 +34,10 @@ export class CheckoutConcurrency1790525537267 implements MigrationInterface {
         await queryRunner.query(`ALTER TABLE "products" DROP COLUMN "stock"`);
         await queryRunner.query(`DROP INDEX "public"."IDX_025b3f44c2e432020bc66bc9f5"`);
         await queryRunner.query(`DROP TABLE "job_queue"`);
-        await queryRunner.query(`DROP TABLE "typeorm_metadata"`);
+        // Deliberately NOT dropping "typeorm_metadata" here: it's shared
+        // infrastructure created once for later migrations (HW #15/#16) to
+        // rely on, not something this migration owns. Reverting this HW
+        // must not tear down infrastructure that other migrations use.
     }
 
 }
