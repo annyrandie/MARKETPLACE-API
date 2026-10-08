@@ -606,8 +606,11 @@ skew (a host `pg_dump` can emit an archive format this project's
 `postgres:16` `pg_restore` can't read — hit exactly this locally, fixed by
 dumping with the same image `db` runs) and PgBouncer transaction mode (see
 above). Output goes to `backups/` (gitignored), named
-`<db>_<YYYYMMDD>_<HHMMSS>.dump`. `backup.cron` runs the same script nightly
-through the same `scripts/with-secrets.sh` wrapper a human would use.
+`<db>_<YYYYMMDD>_<HHMMSS>.dump`, alongside a `.checksum` sidecar —
+`count(*) || '|' || sum(price_cents)` on `products`, captured from the same
+`db` connection at the moment of the dump, not re-derived later. `backup.cron`
+runs the same script nightly through the same `scripts/with-secrets.sh`
+wrapper a human would use.
 
 ### Restore drill
 
@@ -617,17 +620,25 @@ npm run restore-drill
 
 Takes the newest file in `backups/`, spins up `restore` (profile `drill`) —
 a `postgres:16-alpine` container on a **volume that did not exist a moment
-ago** — `pg_restore --no-owner --no-acl` into it, then compares
-`count(*) || '|' || sum(price_cents)` on `products` between the live DB
-(read through PgBouncer) and the freshly-restored copy. `--no-acl` alongside
+ago** — `pg_restore --no-owner --no-acl` into it, then compares the restored
+copy's checksum against the `.checksum` sidecar `scripts/backup.sh` wrote
+for that exact dump. Deliberately **not** a live re-query of the current
+DB: a nightly backup and a morning drill are hours apart, and anything
+written to `products` in between (another demo run, a real order) would
+read back as a false `MISMATCH` against a dump that was perfectly fine —
+the sidecar freezes what *this dump* actually contains. `--no-acl` alongside
 the assignment's own `--no-owner` hint for the same reason: the dump also
 carries `init.sql`'s `GRANT … TO app_user`, and that role deliberately
 doesn't exist in this disposable target. Prints `MATCH` and exits 0, or
 `MISMATCH`/a restore error and exits non-zero. Self-cleans via a `trap` on
 exit — success or failure — so the container and volume are gone again by
 the time the script returns, and a second run is guaranteed to restore into
-a genuinely empty database, not leftovers from the first. Recorded result
-of one real run: [RESTORE-DRILL.md](RESTORE-DRILL.md).
+a genuinely empty database, not leftovers from the first. Cleanup goes
+through `docker compose … down -v restore` rather than a hardcoded volume
+name, so it still finds and removes the right volume under a different
+`COMPOSE_PROJECT_NAME` instead of leaving it behind for the next run to
+collide with. Recorded result of one real run:
+[RESTORE-DRILL.md](RESTORE-DRILL.md).
 
 ### Rotation still works with PgBouncer in front
 

@@ -32,6 +32,17 @@ mkdir -p "$BACKUP_DIR"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 OUT="$BACKUP_DIR/${DB_NAME}_${STAMP}.dump"
 
+# Checksum captured right alongside the dump, from the same `db` connection,
+# not re-read later by the drill. A nightly backup.sh and a morning
+# restore-drill.sh are hours apart — if the drill re-queried the *live* DB
+# for "before", any write in between (a new order, another demo run) would
+# read back as a false MISMATCH on a dump that was perfectly fine. The
+# sidecar freezes what this dump actually contains, at the moment it was
+# taken.
+CHECKSUM="$(docker compose exec -T db psql -U "$DB_USER" -d "$DB_NAME" -Atc \
+  "SELECT count(*) || '|' || coalesce(sum(price_cents), 0) FROM products")"
+echo "$CHECKSUM" > "${OUT}.checksum"
+
 docker compose exec -T db pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc > "$OUT"
 
 SIZE="$(du -h "$OUT" | cut -f1)"

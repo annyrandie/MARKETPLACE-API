@@ -2,26 +2,25 @@
 # Restore drill: take the most recent scripts/backup.sh dump, restore it
 # into a container/volume that did NOT exist a moment ago, and prove the
 # data actually came back — count(*) + sum(price_cents) on `products`
-# before (read through PgBouncer, the live DB) and after (read from the
-# freshly-restored clean copy). A backup nobody has restored is a lottery
-# ticket, not a backup.
-#
-# Same connection contract as scripts/backup.sh: DB_HOST/DB_PORT/DB_USER/
-# DB_PASSWORD/DB_NAME from scripts/with-secrets.sh.
+# at dump time (read from the .checksum sidecar scripts/backup.sh wrote,
+# NOT re-queried from the live DB now — see that file's comment: backup and
+# drill can run hours apart, and the live DB may have moved on since) vs.
+# the freshly-restored clean copy. A backup nobody has restored is a
+# lottery ticket, not a backup.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-
-: "${DB_HOST:?DB_HOST is not set — run via: bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh}"
-: "${DB_PORT:?}"
-: "${DB_USER:?}"
-: "${DB_NAME:?}"
-: "${DB_PASSWORD:?}"
 
 BACKUP_DIR="${BACKUP_DIR:-$ROOT/backups}"
 LATEST="$(ls -1t "$BACKUP_DIR"/*.dump 2>/dev/null | head -n1 || true)"
 if [ -z "$LATEST" ]; then
   echo "✗ No backup found in $BACKUP_DIR — run scripts/backup.sh first." >&2
+  exit 1
+fi
+
+CHECKSUM_FILE="${LATEST}.checksum"
+if [ ! -f "$CHECKSUM_FILE" ]; then
+  echo "✗ No $CHECKSUM_FILE — this dump predates the checksum sidecar; re-run scripts/backup.sh." >&2
   exit 1
 fi
 
@@ -38,16 +37,22 @@ secs() { awk -v ms="$1" 'BEGIN { printf "%.1f", ms / 1000 }'; }
 CHECKSUM_SQL="SELECT count(*) || '|' || coalesce(sum(price_cents), 0) FROM products"
 
 cleanup() {
-  docker compose --profile drill rm -sf restore >/dev/null 2>&1 || true
-  docker volume rm -f marketplace-api_pgdata-restore >/dev/null 2>&1 || true
+  # `down -v`, not a hardcoded volume name: the volume's actual name is
+  # <project>_pgdata-restore, and <project> is whatever COMPOSE_PROJECT_NAME
+  # (or -p) resolves to for this invocation — not necessarily this repo's
+  # compose `name:` default. `down -v`, scoped to the `restore` service,
+  # asks Compose to resolve and remove that volume itself instead of us
+  # guessing its name, so a different project name can't leave orphaned
+  # volumes behind for the next drill to collide with.
+  docker compose --profile drill down -v restore >/dev/null 2>&1 || true
 }
 # The drill always tears down its own container+volume on the way out —
 # success or failure — so the next run (this one included, re-entered after
 # a crash) always starts from a volume that genuinely did not exist before.
 trap cleanup EXIT
 
-echo "━━━ 1. Checksum on the live DB (through PgBouncer) ━━━"
-BEFORE="$(PGPASSWORD="$DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -Atc "$CHECKSUM_SQL")"
+echo "━━━ 1. Checksum at backup time (from the .checksum sidecar) ━━━"
+BEFORE="$(cat "$CHECKSUM_FILE")"
 echo "  products before: $BEFORE  (count|sum(price_cents))"
 
 echo "━━━ 2. Clean restore target (profile: drill) ━━━"
@@ -75,7 +80,7 @@ AFTER="$(docker compose exec -T restore psql -U admin -d marketplace -Atc "$CHEC
 echo "  products after:  $AFTER"
 
 if [ "$BEFORE" = "$AFTER" ]; then
-  echo "MATCH — restored data equals the live DB by checksum ($(secs "$RESTORE_MS")s)"
+  echo "MATCH — restored data equals the dump's checksum at backup time ($(secs "$RESTORE_MS")s)"
 else
   echo "MISMATCH: before='$BEFORE' after='$AFTER'" >&2
   exit 1
