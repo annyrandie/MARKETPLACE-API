@@ -1,7 +1,7 @@
 {
   "name": "marketplace-api",
   "version": "1.0.0",
-  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15)",
+  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16)",
   "main": "app.js",
   "scripts": {
     "start": "node app.js",
@@ -26,6 +26,10 @@
     "demo:retry": "bash scripts/with-secrets.sh dev node dist/demo-retry.js",
     "backup": "bash scripts/with-secrets.sh dev bash scripts/backup.sh",
     "restore-drill": "bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh",
+    "test:integration": "npm run build --silent && jest --config jest.integration.config.js",
+    "test:e2e": "jest --config jest.e2e.config.js",
+    "test:contract": "node --test test/contract/consumer.pact.test.js",
+    "verify:provider": "node test/contract/verify-provider.js",
     "test": "echo \"no automated tests for variant B — see README, Verification section\" && exit 0"
   },
   "keywords": [],
@@ -41,9 +45,13 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@pact-foundation/pact": "^16.5.0",
     "@redocly/cli": "^2.46.0",
+    "@testcontainers/postgresql": "^11.14.0",
     "@types/node": "^22.20.4",
     "@types/pg": "^8.23.1",
+    "jest": "^30.5.2",
+    "supertest": "^7.3.1",
     "typescript": "^6.0.3"
   }
 }
