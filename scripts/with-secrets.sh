@@ -52,4 +52,21 @@ console.log('export DB_NAME=' + JSON.stringify(u.pathname.slice(1)));
 export DB_PASSWORD
 DB_PASSWORD="$(cat "$ROOT/$DB_PASSWORD_FILE")"
 
+# HW #16: Pact Broker address + token, same vault, same file-based
+# convention as DB_PASSWORD above — NOT part of .env/.env.example, since
+# those are app.js's own config contract (checked by npm run check:env
+# against env.schema.js) and the broker has nothing to do with the app's
+# runtime config. Both files are optional: the URL falls back to this
+# repo's own docker-compose broker (not a secret — see the assignment's own
+# "http://127.0.0.1:<port> is fine" allowance); the token falls back to
+# empty, which is exactly correct for that same local broker, since it runs
+# with no auth configured (PACT_BROKER_ALLOW_PUBLIC_READ, no basic-auth env
+# vars in docker-compose.yml). A real hosted broker would have both files
+# populated with its real address and a real token, still never committed —
+# secrets/* is gitignored, same as secrets/db_password.
+export PACT_BROKER_URL
+PACT_BROKER_URL="$([ -f "$ROOT/secrets/pact_broker_url" ] && cat "$ROOT/secrets/pact_broker_url" || echo 'http://127.0.0.1:9292')"
+export PACT_BROKER_TOKEN
+PACT_BROKER_TOKEN="$([ -f "$ROOT/secrets/pact_broker_token" ] && cat "$ROOT/secrets/pact_broker_token" || echo '')"
+
 exec "$@"
