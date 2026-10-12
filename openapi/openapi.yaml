@@ -187,6 +187,64 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /orders/{orderId}/status:
+    patch:
+      operationId: updateOrderStatus
+      tags: [orders]
+      summary: >
+        Change an order's status. Triggers a realtime notification (HW #18)
+        to every client subscribed to this order — via WebSocket (room
+        `orders:<id>`) and via the equivalent SSE stream below — not just a
+        change to the stored record.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewOrderStatus'
+      responses:
+        '200':
+          description: Order updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /orders/{orderId}/events:
+    get:
+      operationId: streamOrderEvents
+      tags: [orders]
+      summary: >
+        Server-Sent Events stream of this order's status changes (HW #18).
+        Not validated against a JSON response schema below — unlike every
+        other operation in this spec, this one never produces a single,
+        complete response body to validate; it's a long-lived
+        `text/event-stream` connection. Registered in app.js BEFORE the
+        OpenAPI validator middleware, the same way `/health` is (see
+        app.js's own comment) — documented here for completeness, not
+        enforced by express-openapi-validator. Supports `Last-Event-ID` for
+        resuming after a reconnect; see README's Testing section.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: >
+            `text/event-stream`. Each event has `id:` (an increasing,
+            per-order sequence number), `event: order.status`, and
+            `data:` holding `{"status": "<new status>"}` as JSON.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
 components:
   parameters:
     Limit:
@@ -330,6 +388,15 @@ components:
           items:
             $ref: '#/components/schemas/OrderItem'
 
+    NewOrderStatus:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [created, paid, shipped, completed, cancelled]
+
     Order:
       type: object
       required: [id, status, items, total_cents, created_at]
@@ -338,7 +405,7 @@ components:
           type: string
         status:
           type: string
-          enum: [created]
+          enum: [created, paid, shipped, completed, cancelled]
         items:
           type: array
           items:

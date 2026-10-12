@@ -22,6 +22,10 @@ on top: integration tests against a real Postgres (testcontainers, not
 mocks), an E2E happy path through the real app, and a Pact contract that
 makes HW #9's spec executable — verified against a real broker, with
 `can-i-deploy` as an actual gate. See [Testing](#testing-hw-16) below.
+HW #18 adds a realtime layer on top of HW #14's status changes: a
+WebSocket gateway and an SSE stream off one shared event bus, proven with
+a headless room-isolation demo that has its own built-in control run. See
+[Realtime](#realtime-hw-18) below.
 
 ## Quickstart for the grader
 
@@ -98,6 +102,10 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `test/contract/verify-provider.js` | provider verification — local `pacts/*.json` or the broker, chosen by `PACT_BROKER_URL` |
 | `jest.config.js` / `jest.integration.config.js` / `jest.e2e.config.js` | shared `reporters: ['default']` base + per-suite `testMatch`/`testTimeout` |
 | `.github/workflows/contract.yml` | CI `contract` job: publish → verify (`publishVerificationResult`) → `can-i-deploy` → deploy → tag (in that order — see Testing below for why) |
+| `src/realtime/order-events.service.ts` | the shared event bus (RxJS `Subject`) + per-order buffer, used by both transports |
+| `src/realtime/orders.gateway.ts` | `attachOrdersGateway()` — socket.io room join (with the ownership guard) + room-scoped emit |
+| `src/realtime/orders.controller.ts` | `createOrderEventsSseHandler()` — the SSE route, `id:`/`Last-Event-ID` included |
+| `scripts/realtime-demo.mjs` | headless room-isolation demo + its own `--same-room` control run |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -343,6 +351,13 @@ npm run test:integration   # again — proves isolation, no manual cleanup
 npm run test:e2e
 npm run test:contract
 npm run verify:provider
+
+# HW #18 — realtime (no DB/docker needed for this part — see Realtime below)
+npm start &
+sleep 1
+node scripts/realtime-demo.mjs;             echo "exit=$?"
+node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
+kill %1
 ```
 
 (Port `6432`, not `5433` — every one of the commands above (`migrate`
@@ -931,6 +946,101 @@ secret in a real hosted-broker setup; this job's local broker needs none,
 same as the walkthrough above — which stays a hand-driven, pedagogical
 demonstration of the *mechanism* (tag then check, on purpose, to show
 unknown → true), a different exercise from this job's actual gate.
+
+## Realtime (HW #18)
+
+The order-status change HW #14's `checkout()` already does transactionally
+now reaches a connected client the instant it happens — two transports off
+one shared event bus, not two independent implementations.
+
+```bash
+npm run build
+npm start                                        # WebSocket + SSE both enabled
+
+# main run — B is in a DIFFERENT room, must NOT hear A's event
+node scripts/realtime-demo.mjs;            echo "exit=$?"
+# control run — B is in the SAME room, MUST hear it
+node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
+```
+
+Neither the demo nor `npm start` needs a reachable Postgres: `app.js`'s
+`DB_URL`/password are only ever touched by `/health`'s lazy `pool.query()`
+(see [Configuration](#configuration)), which this flow never calls —
+verified by stopping every container and deleting `secrets/db_password`
+outright and running both demo modes anyway. A plain `cp .env.example
+.env` is the only setup step this section needs.
+
+### No Nest here, either
+
+The assignment's own wording (`@WebSocketGateway()`, `NestFactory.create`)
+describes the lecture's stack, not this repo's — this project has been
+Express since HW #9's "variant B" decision, unchanged through every HW
+since. `src/realtime/orders.gateway.ts` and `orders.controller.ts` are the
+framework-agnostic equivalent: plain functions (`attachOrdersGateway`,
+`createOrderEventsSseHandler`) instead of decorated classes, wired into
+`app.js` by hand instead of Nest's DI container. The `OrderEventsService`
+(an RxJS `Subject`, exactly as asked) is the one piece that doesn't care
+either way — both transports subscribe to the same instance, which is the
+actual point of that file regardless of framework.
+
+Two real, pre-existing gaps this feature exposed and had to work around,
+not invent:
+
+- **No status-change endpoint existed.** HW #14's `checkout()` sets an
+  order's status transactionally, but only against the real
+  Postgres-backed data layer (`src/`), which — as HW #16's review already
+  established — has no HTTP route of its own; `app.js`'s in-memory
+  `/orders` never called it. `PATCH /orders/:orderId/status` is new,
+  documented in `openapi/openapi.yaml`, and is the "existing endpoint"
+  this HW's own emit hooks into — `app.js`'s route handler calls
+  `orderEvents.emitStatusChange(...)` directly; `orders.gateway.ts` and
+  `orders.controller.ts` only ever learn about it by subscribing, the same
+  as any other listener would.
+- **No ownership concept existed.** In-memory orders had no owner field at
+  all. `POST /orders` now reads an `X-User-Id` header (optional — an order
+  created without one just can't be joined by anyone, not a behavior
+  change for anyone who doesn't use this feature) and the WebSocket
+  `join` handler checks it against the order on record before calling
+  `socket.join(...)` — missing, mismatched, or unknown order are all
+  refused the same way. `userId` never appears in any HTTP response; it's
+  this feature's own bookkeeping, not part of the documented `Order`
+  schema.
+
+### Last-Event-ID, proven with 5 real events
+
+```
+curl -sN --max-time 2 -H 'Last-Event-ID: 3' http://localhost:3000/orders/order_1/events | grep '^id:'
+# id: 4
+```
+
+Exactly one event back (`id: 4`), not `id: 5` and not both — the buffer
+replay returns everything strictly newer than the client's last-seen id,
+in order, no gaps, no duplicates.
+
+## Trade-offs: WebSocket vs SSE
+
+| Критерій | WebSocket (socket.io) | SSE |
+|---|---|---|
+| Напрям каналу | Повнодуплексний — клієнт теж пише в той самий канал (`join`, і будь-яка майбутня команда) | Лише сервер → клієнт; будь-яка дія клієнта (змінити статус) йде окремим звичайним HTTP-запитом |
+| Реконект / відновлення | `socket.io-client` сам перепідключається (backoff з коробки), але після реконекту сокет просто знову в кімнаті — подій, пропущених під час розриву, НЕМАЄ, якщо застосунок сам їх не передасть | `EventSource` реконектиться у браузері сам (керується `retry:`), і `Last-Event-ID` дозволяє серверу домовити саме пропущене з буфера — відновлення вбудоване в сам протокол, не доробка застосунку |
+| Вимоги до інфраструктури | HTTP-upgrade до `ws://`; будь-який проксі/балансувальник на шляху має його розуміти; кімнати на 2+ інстансах потребують спільного адаптера (нижче) | Звичайний HTTP-запит, що просто не закривається — проходить крізь будь-що, що розуміє keep-alive; той самий адаптер усе одно потрібен для кімнат на 2+ інстансах |
+| Ціна на подію | Мінімальний фрейм після разового handshake — найдешевше за байт на подію | Теж одне довгоживуче з'єднання (не новий HTTP-запит на кожну подію), але кожна подія несе текстовий префікс (`id:`/`event:`/`data:`) — трохи більше байт, той самий порядок величини |
+
+Якби лишати один транспорт для нотифікацій про статус замовлення в проді —
+лишила б **SSE**: на цьому конкретному потоці клієнт нічого не надсилає у
+відповідь, а вбудоване `Last-Event-ID`-відновлення точно відповідає
+реальній потребі («що я пропустив, доки був offline») без жодного коду
+понад те, що протокол уже дає. WebSocket виграв би лише якби клієнту
+справді треба було писати НАЗАД у той самий канал (живий чат із
+диспетчером) — у цієї фічі такої потреби немає.
+
+**Два інстанси за балансувальником ламають кімнати в обох транспортах
+однаково**: інстанс №2 не знає, хто приєднався до `orders:<id>` на
+інстансі №1, тож `io.to(room).emit(...)` (і еквівалент для SSE-буфера)
+дістає лише сокети/з'єднання, підключені саме до ТОГО процесу — лікується
+`@socket.io/redis-adapter` (Лекція 23, крок 7), який через Redis pub/sub
+синхронізує членство в кімнатах і емітовані події між усіма інстансами,
+так що `to(room)` знову працює як один спільний сервер.
 
 ## Verification (acceptance criteria)
 
