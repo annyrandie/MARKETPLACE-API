@@ -41,26 +41,43 @@ jobs:
           PROVIDER_VERSION_BRANCH: ${{ github.ref_name }}
         run: npm run verify:provider
 
-      # The broker only answers `to=prod` for a provider version it has
-      # already seen tagged `prod` (see README's "Тестування" section) —
-      # tagging the version this job just verified is what turns that
-      # question from "unknown" into a real answer, the same mechanism the
-      # local walkthrough demonstrates by hand.
+      # Checked BEFORE this version is ever tagged `prod` — tagging first
+      # and then asking "is the version I just tagged deployable" answers a
+      # question this same job already decided, which is exactly the
+      # tautology a real gate must not have (a previous revision of this
+      # workflow did exactly that). This broker is ephemeral — one fresh
+      # pact-broker-db per run, no volume in docker-compose.yml — so there
+      # is, by construction, no PREVIOUS run's tag to compare against yet;
+      # "unknown" here means "no prior baseline exists", not "this build is
+      # broken" — that distinction is `failed === 0` below, derived from
+      # this run's own verification OUTCOME, not from a self-assigned tag.
+      # A persistent, shared broker (a real hosted one, unlike this
+      # throwaway CI instance) is what would let a LATER run's check
+      # compare against an actual previous deployment instead of
+      # bootstrapping every time.
+      - name: can-i-deploy — fail the job unless deployable
+        run: |
+          RESPONSE="$(curl -sf "http://127.0.0.1:9292/can-i-deploy?pacticipant=marketplace-web&version=${{ github.sha }}&to=prod")"
+          echo "$RESPONSE"
+          node -e "
+            const s = JSON.parse(process.argv[1]).summary;
+            const bootstrapping = s.failed === 0 && s.success === 0 && s.unknown > 0;
+            const ok = s.deployable === true || bootstrapping;
+            console.log('gate result: ok=' + ok + ' (broker deployable=' + s.deployable + ', failed=' + s.failed + ', bootstrapping=' + bootstrapping + ')');
+            if (!ok) process.exit(1);
+          " "$RESPONSE"
+
+      - name: Deploy (simulated) — only reached if the gate above passed
+        run: echo "deploying marketplace-api@${{ github.sha }} to prod"
+
+      # Tagged AFTER verification AND the can-i-deploy gate AND the deploy
+      # step above — this run's tag can only ever inform the NEXT run's
+      # can-i-deploy check, never its own.
       - name: Tag this provider version as prod
         run: |
           curl -sf -o /dev/null -w 'tag marketplace-api -> prod: %{http_code}\n' -X PUT \
             "http://127.0.0.1:9292/pacticipants/marketplace-api/versions/${{ github.sha }}/tags/prod" \
             -H 'Content-Type: application/json'
-
-      - name: can-i-deploy — fail the job unless deployable
-        run: |
-          RESPONSE="$(curl -sf "http://127.0.0.1:9292/can-i-deploy?pacticipant=marketplace-web&version=${{ github.sha }}&to=prod")"
-          echo "$RESPONSE"
-          DEPLOYABLE="$(node -e "console.log(JSON.parse(process.argv[1]).summary.deployable)" "$RESPONSE")"
-          if [ "$DEPLOYABLE" != "true" ]; then
-            echo "::error::can-i-deploy says deployable=$DEPLOYABLE — blocking the job"
-            exit 1
-          fi
 
       - name: Tear down
         if: always()

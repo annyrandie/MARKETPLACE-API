@@ -21,7 +21,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const { Verifier } = require('@pact-foundation/pact');
 const { PostgreSqlContainer } = require('@testcontainers/postgresql');
-const { PRODUCT_CATALOG_SEEDED } = require('./provider-states');
+const { ORDER_ALREADY_EXISTS_FOR_KEY } = require('./provider-states');
+
+const IDEMPOTENCY_KEY = 'contract-test-key-1';
 
 const PROVIDER_PORT = Number(process.env.PROVIDER_PORT || 4100);
 const PACT_FILE = path.resolve(__dirname, '..', '..', 'pacts', 'marketplace-web-marketplace-api.json');
@@ -64,13 +66,23 @@ async function main() {
         provider: 'marketplace-api',
         providerBaseUrl: `http://127.0.0.1:${PROVIDER_PORT}`,
         stateHandlers: {
-          // No-op, not a stub: app.js's seedProducts() already guarantees
-          // "prod_1" exists the instant the app finishes starting up — this
-          // app's product catalog is in-memory by HW #9's own design, not
-          // DB-backed, so there is no SQL this state handler needs to run to
-          // make the precondition true. A DB-backed resource would INSERT
-          // here instead (ON CONFLICT DO NOTHING, for repeatable verification).
-          [PRODUCT_CATALOG_SEEDED]: async () => {},
+          // A REAL first request through the app's own API — this is what
+          // actually makes "an order already exists for this key" true.
+          // Remove this handler's POST and the interaction genuinely fails:
+          // the repeat request the Verifier sends next would hit an empty
+          // idempotencyStore, get treated as a brand-new order (a fresh id,
+          // no Idempotency-Replay header), and mismatch the contract's
+          // expected response — unlike a product-existence state, which
+          // app.js's unconditional seedProducts() would keep satisfying
+          // whether or not any handler ran at all.
+          [ORDER_ALREADY_EXISTS_FOR_KEY]: async () => {
+            const res = await fetch(`http://127.0.0.1:${PROVIDER_PORT}/orders`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Idempotency-Key': IDEMPOTENCY_KEY },
+              body: JSON.stringify({ items: [{ product_id: 'prod_1', quantity: 1 }] }),
+            });
+            if (!res.ok) throw new Error(`state handler POST /orders failed: ${res.status}`);
+          },
         },
         logLevel: 'info',
       };

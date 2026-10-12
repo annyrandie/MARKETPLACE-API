@@ -91,11 +91,13 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `test/integration/testkit/container.js` | starts a real `postgres:16-alpine`, builds its schema from the actual `src/migrations/*.ts` |
 | `test/integration/testkit/builders.js` | `aUser()`/`aProduct()` — unique, valid defaults |
 | `test/integration/*.test.js` | repository tests: unique/FK constraint, JOIN, aggregation, `ON CONFLICT` |
-| `test/e2e/app.e2e.test.js` | supertest against the real `createApp()`, DB from a testcontainer |
+| `test/e2e/app.e2e.test.js` | supertest against the real `createApp()` — the HTTP half, in-memory by HW #9's design |
+| `test/e2e/checkout.e2e.test.js` | the real `checkout()` (HW #14) against a real Postgres — the data-layer half |
+| `test/contract/provider-states.js` | one provider-state string, shared by the consumer test and the state handler so they can't drift apart |
 | `test/contract/consumer.pact.test.js` | Pact consumer test → `pacts/*.json` (gitignored, regenerated on demand) |
 | `test/contract/verify-provider.js` | provider verification — local `pacts/*.json` or the broker, chosen by `PACT_BROKER_URL` |
 | `jest.config.js` / `jest.integration.config.js` / `jest.e2e.config.js` | shared `reporters: ['default']` base + per-suite `testMatch`/`testTimeout` |
-| `.github/workflows/contract.yml` | CI `contract` job: publish → verify (`publishVerificationResult`) → tag → `can-i-deploy` |
+| `.github/workflows/contract.yml` | CI `contract` job: publish → verify (`publishVerificationResult`) → `can-i-deploy` → deploy → tag (in that order — see Testing below for why) |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -744,7 +746,11 @@ perfectly green suite. Fixed by using ONE pool for both migrations and the
 handle tests get, with a `pool.on('error', ...)` safety net (the same
 pattern `app.js`'s own pool already uses for exactly this reason).
 
-### E2E: the real app, no substitution
+### E2E: the real app, no substitution — HTTP half and data-layer half
+
+Two files, because this project's HTTP surface and its real data layer are
+two historically separate systems (see below) and a single E2E file can't
+honestly claim to cover both.
 
 `test/e2e/app.e2e.test.js` calls `createApp()` straight from `app.js` —
 the exact factory `npm start` itself calls — and points its DB config at a
@@ -752,27 +758,54 @@ fresh testcontainer instead of `.env`. No Nest here: this project's chosen
 stack is Express + `express-openapi-validator` (HW #9's own "variant B"
 decision), so "the real app, no provider substitution" means the same
 `createApp()` supertest drives, not a parallel DI module built only for
-tests. No migrations run against the testcontainer either — `/products` and
-`/orders` are in-memory by that same HW #9 decision, not DB-backed; the
+tests. No migrations run against this particular testcontainer — `/products`
+and `/orders` are in-memory by that same HW #9 decision, not DB-backed; the
 testcontainer exists because `app.js` fails fast without a real,
 reachable Postgres for its config validation and `/health` route, the same
 contract it has everywhere else. Happy path: `POST /products` → `201`,
 then `GET /products/:id` → `200` the identical row. Negative case:
 an unknown id → `404 application/problem+json`, not a crash.
 
+That leaves a real gap: HW #9's in-memory app never calls `src/checkout.ts`
+(HW #14), which has no HTTP route of its own — so nothing above touches
+this project's actual Postgres-backed business logic. A change that broke
+checkout's no-oversell guarantee would sail through `app.e2e.test.js`,
+the contract, AND HW #14's own CLI demos untouched. `test/e2e/checkout.e2e.test.js`
+closes that gap: it runs the real `checkout()` — the project's most
+significant business feature — against a real Postgres (the same
+real-migrations testkit the integration suite uses), the same way HW #14's
+`demo-race.ts` exercises it against a dev database. Happy path: stock and
+balance both decrement by exactly the right amount, a real `orders` row
+exists. Negative case: insufficient stock rejects with
+`InsufficientStockError`, and the stock column is provably unchanged —
+the whole transaction rolled back, not just the failed check.
+
 ### Contract: Pact makes the OpenAPI spec executable
 
 `test/contract/consumer.pact.test.js` — an imagined frontend,
-`marketplace-web`, describes `GET /products/{productId}` (straight out of
-`openapi/openapi.yaml`) against a Pact mock server and writes
+`marketplace-web`, describes a **repeat** `POST /orders` with the same
+`Idempotency-Key` (straight out of `openapi/openapi.yaml` — HW #9's own
+"Bonus challenge") against a Pact mock server and writes
 `pacts/marketplace-web-marketplace-api.json`. `test/contract/verify-provider.js`
 then runs the **real** app and asks `@pact-foundation/pact`'s `Verifier`
-to replay every interaction against it — `stateHandlers` is where a
-DB-backed resource would get seeded (`INSERT ... ON CONFLICT DO NOTHING`,
-so verification stays repeatable); this project's one interaction needs a
-no-op handler instead, because `app.js`'s product catalog is in-memory and
-`seedProducts()` already guarantees `prod_1` exists the instant the app
-finishes starting — there's no SQL this particular precondition needs.
+to replay every interaction against it.
+
+The provider state is "an order already exists for this Idempotency-Key",
+not "a product exists" — and that's deliberate. `app.js`'s `seedProducts()`
+runs unconditionally on every startup, so there is no way to observe this
+app with an empty catalog; a state handler for "a product exists" would be
+decorative no matter what it did (or didn't do). Idempotency replay is
+genuinely false by default — a fresh app's `idempotencyStore` starts
+empty — and only becomes true because the state handler makes a real
+first `POST /orders` through the app's own HTTP API before the Verifier
+replays the second one. Proven, not assumed: temporarily neutering that
+handler's request (while leaving everything else untouched) turns the
+same interaction red —
+`Expected header 'Idempotency-Replay' to have value '"true"' but was ''`
+— and restoring it turns it back to `has a matching body (OK)`. A
+DB-backed resource would `INSERT ... ON CONFLICT DO NOTHING` here instead;
+this app's catalog/orders are in-memory by HW #9's own design, so its own
+HTTP write path is the equivalent repeatable action.
 
 Neither contract file runs under jest: `@pact-foundation/pact`'s `Verifier`
 module transitively requires an ESM-only `https-proxy-agent`, which jest's
@@ -869,16 +902,35 @@ tagged `prod` with a published, successful verification sitting behind it
 — which is the entire mechanism `can-i-deploy` exists to check, not a
 gate that's wired to always say yes.
 
-### CI: the same gate, automated
+### CI: the same gate, automated — not tag-then-check-itself
 
-`.github/workflows/contract.yml`'s `contract` job runs the identical
-sequence against the commit's own SHA as the provider/consumer version:
-bring up the stack → `test:contract` → publish → `verify:provider` with
-`PACT_BROKER_URL` pointed at the job's own broker container
-(`publishVerificationResult: true`) → tag that SHA `prod` → `can-i-deploy`,
-and fails the job outright if `deployable` isn't `true`. `PACT_BROKER_TOKEN`
-would come from a GitHub Actions secret in a real hosted-broker setup; this
-job's local broker needs none, same as the walkthrough above.
+`.github/workflows/contract.yml`'s `contract` job runs against the
+commit's own SHA as the provider/consumer version: bring up the stack →
+`test:contract` → publish → `verify:provider` with `PACT_BROKER_URL`
+pointed at the job's own broker container (`publishVerificationResult:
+true`) → **`can-i-deploy`, checked before this SHA is ever tagged `prod`**
+→ a simulated "deploy" step → tag this SHA `prod`, in that order.
+
+That ordering is deliberate, and fixes a real bug an earlier revision of
+this workflow had: tagging the SHA `prod` and then immediately asking
+`can-i-deploy` about that same SHA is a tautology — a gate that always
+answers the question it was just told the answer to can never go red. The
+can-i-deploy step now runs first, against whatever a PREVIOUS run tagged
+(this job's `pact-broker-db` has no volume, so on this particular
+throwaway CI broker that's usually nothing yet). The step distinguishes
+two different reasons the broker might say "not deployable":
+`failed === 0 && success === 0 && unknown > 0` means *no prior baseline
+exists to compare against* — a legitimate bootstrap case, not a broken
+build — and the gate proceeds; any actual `failed` result (a real
+verification mismatch) blocks the job regardless. Verified, not assumed:
+fed the same script a real `unknown`-only response (bootstrap → proceeds),
+a synthetic `failed: 1` response (blocks, `exit 1`), and a real
+`deployable: true` response (proceeds) — three different inputs, three
+correct outcomes. `PACT_BROKER_TOKEN` would come from a GitHub Actions
+secret in a real hosted-broker setup; this job's local broker needs none,
+same as the walkthrough above — which stays a hand-driven, pedagogical
+demonstration of the *mechanism* (tag then check, on purpose, to show
+unknown → true), a different exercise from this job's actual gate.
 
 ## Verification (acceptance criteria)
 

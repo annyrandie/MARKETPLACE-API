@@ -27,7 +27,7 @@
     "backup": "bash scripts/with-secrets.sh dev bash scripts/backup.sh",
     "restore-drill": "bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh",
     "test:integration": "npm run build --silent && jest --config jest.integration.config.js",
-    "test:e2e": "jest --config jest.e2e.config.js",
+    "test:e2e": "npm run build --silent && jest --config jest.e2e.config.js",
     "test:contract": "node --test test/contract/consumer.pact.test.js",
     "verify:provider": "node test/contract/verify-provider.js",
     "test": "echo \"no automated tests for variant B — see README, Verification section\" && exit 0"
