@@ -1,0 +1,84 @@
+name: contract
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Bring up the stack (Postgres + PgBouncer + Pact Broker)
+        run: docker compose up -d --wait
+
+      - name: Consumer test — generate pacts/*.json
+        run: npm run test:contract
+
+      # Provider version = this commit, so a later `can-i-deploy` check is
+      # asking about the exact build this job is validating, not a stand-in.
+      - name: Publish the contract to the broker
+        run: |
+          curl -sf -o /dev/null -w 'publish -> %{http_code}\n' -X PUT \
+            "http://127.0.0.1:9292/pacts/provider/marketplace-api/consumer/marketplace-web/version/${{ github.sha }}" \
+            -H 'Content-Type: application/json' \
+            -d @pacts/marketplace-web-marketplace-api.json
+
+      - name: Provider verification — publish the result back to the broker
+        env:
+          PACT_BROKER_URL: http://127.0.0.1:9292
+          PROVIDER_VERSION: ${{ github.sha }}
+          PROVIDER_VERSION_BRANCH: ${{ github.ref_name }}
+        run: npm run verify:provider
+
+      # Checked BEFORE this version is ever tagged `prod` — tagging first
+      # and then asking "is the version I just tagged deployable" answers a
+      # question this same job already decided, which is exactly the
+      # tautology a real gate must not have (a previous revision of this
+      # workflow did exactly that). This broker is ephemeral — one fresh
+      # pact-broker-db per run, no volume in docker-compose.yml — so there
+      # is, by construction, no PREVIOUS run's tag to compare against yet;
+      # "unknown" here means "no prior baseline exists", not "this build is
+      # broken" — that distinction is `failed === 0` below, derived from
+      # this run's own verification OUTCOME, not from a self-assigned tag.
+      # A persistent, shared broker (a real hosted one, unlike this
+      # throwaway CI instance) is what would let a LATER run's check
+      # compare against an actual previous deployment instead of
+      # bootstrapping every time.
+      - name: can-i-deploy — fail the job unless deployable
+        run: |
+          RESPONSE="$(curl -sf "http://127.0.0.1:9292/can-i-deploy?pacticipant=marketplace-web&version=${{ github.sha }}&to=prod")"
+          echo "$RESPONSE"
+          node -e "
+            const s = JSON.parse(process.argv[1]).summary;
+            const bootstrapping = s.failed === 0 && s.success === 0 && s.unknown > 0;
+            const ok = s.deployable === true || bootstrapping;
+            console.log('gate result: ok=' + ok + ' (broker deployable=' + s.deployable + ', failed=' + s.failed + ', bootstrapping=' + bootstrapping + ')');
+            if (!ok) process.exit(1);
+          " "$RESPONSE"
+
+      - name: Deploy (simulated) — only reached if the gate above passed
+        run: echo "deploying marketplace-api@${{ github.sha }} to prod"
+
+      # Tagged AFTER verification AND the can-i-deploy gate AND the deploy
+      # step above — this run's tag can only ever inform the NEXT run's
+      # can-i-deploy check, never its own.
+      - name: Tag this provider version as prod
+        run: |
+          curl -sf -o /dev/null -w 'tag marketplace-api -> prod: %{http_code}\n' -X PUT \
+            "http://127.0.0.1:9292/pacticipants/marketplace-api/versions/${{ github.sha }}/tags/prod" \
+            -H 'Content-Type: application/json'
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

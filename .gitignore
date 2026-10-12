@@ -14,3 +14,8 @@ secrets/*
 # HW #15: scripts/backup.sh's dump artifacts — reproducible from a live DB,
 # not something to version.
 backups/
+# HW #16: npm run test:contract regenerates this from src/openapi on every
+# run (and CI's `contract` job does too, as its own step) — committing a
+# stale copy would just drift from whatever the consumer test currently
+# describes.
+pacts/

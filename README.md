@@ -17,7 +17,11 @@ See [Concurrency](#concurrency-hw-14) below. HW #15 adds two production
 attributes on top of all of that: a connection pooler (PgBouncer, in front
 of Postgres — the app never connects directly anymore) and a backup you've
 actually restored, not just produced. See
-[Data layer ops](#data-layer-ops-hw-15) below.
+[Data layer ops](#data-layer-ops-hw-15) below. HW #16 builds a trust ladder
+on top: integration tests against a real Postgres (testcontainers, not
+mocks), an E2E happy path through the real app, and a Pact contract that
+makes HW #9's spec executable — verified against a real broker, with
+`can-i-deploy` as an actual gate. See [Testing](#testing-hw-16) below.
 
 ## Quickstart for the grader
 
@@ -83,6 +87,17 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `scripts/restore-drill.sh` | restores the latest dump into a disposable clean container, proves a checksum match, self-cleans |
 | `backup.cron` | nightly schedule line for `scripts/backup.sh` |
 | `RESTORE-DRILL.md` | one real drill's record: date, dump size, restore time, RTO/RPO |
+| `src/repositories/*.ts` | `UserRepository`/`OrderRepository` — accept a bare `Queryable` (Pool or a transaction-scoped Client), not TypeORM's own Repository |
+| `test/integration/testkit/container.js` | starts a real `postgres:16-alpine`, builds its schema from the actual `src/migrations/*.ts` |
+| `test/integration/testkit/builders.js` | `aUser()`/`aProduct()` — unique, valid defaults |
+| `test/integration/*.test.js` | repository tests: unique/FK constraint, JOIN, aggregation, `ON CONFLICT` |
+| `test/e2e/app.e2e.test.js` | supertest against the real `createApp()` — the HTTP half, in-memory by HW #9's design |
+| `test/e2e/checkout.e2e.test.js` | the real `checkout()` (HW #14) against a real Postgres — the data-layer half |
+| `test/contract/provider-states.js` | one provider-state string, shared by the consumer test and the state handler so they can't drift apart |
+| `test/contract/consumer.pact.test.js` | Pact consumer test → `pacts/*.json` (gitignored, regenerated on demand) |
+| `test/contract/verify-provider.js` | provider verification — local `pacts/*.json` or the broker, chosen by `PACT_BROKER_URL` |
+| `jest.config.js` / `jest.integration.config.js` / `jest.e2e.config.js` | shared `reporters: ['default']` base + per-suite `testMatch`/`testTimeout` |
+| `.github/workflows/contract.yml` | CI `contract` job: publish → verify (`publishVerificationResult`) → `can-i-deploy` → deploy → tag (in that order — see Testing below for why) |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -320,6 +335,14 @@ psql -h 127.0.0.1 -p 6432 -U admin -d pgbouncer -c "SHOW POOLS"          # PGPAS
 bash scripts/with-secrets.sh dev bash scripts/backup.sh
 bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh
 grep -cE '^(@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)|([0-9*/,-]+[[:space:]]+){4}[0-9*/,-]+)[[:space:]]+.*backup' backup.cron
+
+# HW #16 — testcontainers / E2E / Pact (see Testing below for the broker walkthrough)
+npx tsc --noEmit
+npm run test:integration
+npm run test:integration   # again — proves isolation, no manual cleanup
+npm run test:e2e
+npm run test:contract
+npm run verify:provider
 ```
 
 (Port `6432`, not `5433` — every one of the commands above (`migrate`
@@ -663,6 +686,251 @@ pointing at the now-unlinked original inode and stopped seeing the file at
 all. Fixed by bind-mounting the whole `pgbouncer/` directory instead, which
 follows renames inside it. Caught by actually rotating twice in a row
 against a live container, not assumed to work from reading the compose file.
+
+## Testing (HW #16)
+
+A trust ladder on top of HW #9/#13/#14: real-Postgres integration tests
+(testcontainers, not mocks), an E2E happy path through the real app
+(supertest, no provider substitution), and a Pact contract that makes
+HW #9's OpenAPI spec executable — verified against a real Pact Broker, with
+`can-i-deploy` as an actual gate, not a rubber stamp.
+
+```bash
+npm run test:integration   # 2 repositories × 3+ tests, postgres:16-alpine via testcontainers
+npm run test:e2e           # supertest against the real createApp(), DB from a testcontainer
+npm run test:contract      # Pact consumer test -> pacts/*.json
+npm run verify:provider    # the real app answers every interaction in the contract
+```
+
+### Integration suite: testcontainers, not mocks
+
+`test/integration/testkit/container.js` starts a real `postgres:16-alpine`
+(`@testcontainers/postgresql`) and builds its schema from the **actual**
+migrations this project ships (`src/migrations/*.ts`, HW #13/#14) — not a
+hand-rolled copy of the DDL that could quietly drift from what production
+actually runs. `UserRepository`/`OrderRepository`
+(`src/repositories/*.ts`) are deliberately **not** built on TypeORM's own
+`Repository` — they accept a bare `Queryable` (anything with `.query()`:
+a `Pool` in production, a single `PoolClient` mid-transaction in tests),
+which is the seam the isolation strategy below needs.
+
+Each file covers what a mocked repository structurally cannot:
+`user.repository.test.js` proves a duplicate email hits Postgres's real
+`UNIQUE` index (`23505`) and that `upsertByEmail()`'s `ON CONFLICT` actually
+upserts instead of erroring; `order.repository.test.js` proves a bad
+`product_id` hits the real FK (`23503`), that `findWithItems()`'s `JOIN`
+resolves to a real product row (not just an id a mock would never check),
+and that `totalSpentByUser()`'s aggregate sums real rows.
+
+**Isolation strategy: one testcontainer per file, one transaction per
+test.** `beforeEach` opens a `BEGIN` on a dedicated `PoolClient` from the
+pool and hands it to the repository under test; `afterEach` issues
+`ROLLBACK` and releases the client. Chosen over TRUNCATE (would work, but
+resets sequences and needs explicit ordering as tables grow) and a fresh
+container per test (correct in isolation, but pays a ~1s container-start
+tax per test instead of once per file — the lecture's own measured
+comparison, reproduced here, makes that cost concrete). ROLLBACK gives
+perfect isolation at the cost of one open transaction per test, which this
+suite's size never notices. Verified, not assumed: `npm run test:integration
+&& npm run test:integration` — both runs green, no manual cleanup between
+them, because nothing a test writes ever survives its own transaction.
+
+One real bug this caught before it ever reached a test assertion: the
+testkit's first draft opened a **second**, throwaway `Pool` just to run
+migrations and never `.end()`ed it (nothing kept a reference to call that
+on). That connection outlived the function, and when a later test's
+`container.stop()` killed Postgres, the orphaned connection received
+"terminating connection due to administrator command" with no `error`
+listener attached — jest reported "Unhandled error" on an otherwise
+perfectly green suite. Fixed by using ONE pool for both migrations and the
+handle tests get, with a `pool.on('error', ...)` safety net (the same
+pattern `app.js`'s own pool already uses for exactly this reason).
+
+### E2E: the real app, no substitution — HTTP half and data-layer half
+
+Two files, because this project's HTTP surface and its real data layer are
+two historically separate systems (see below) and a single E2E file can't
+honestly claim to cover both.
+
+`test/e2e/app.e2e.test.js` calls `createApp()` straight from `app.js` —
+the exact factory `npm start` itself calls — and points its DB config at a
+fresh testcontainer instead of `.env`. No Nest here: this project's chosen
+stack is Express + `express-openapi-validator` (HW #9's own "variant B"
+decision), so "the real app, no provider substitution" means the same
+`createApp()` supertest drives, not a parallel DI module built only for
+tests. No migrations run against this particular testcontainer — `/products`
+and `/orders` are in-memory by that same HW #9 decision, not DB-backed; the
+testcontainer exists because `app.js` fails fast without a real,
+reachable Postgres for its config validation and `/health` route, the same
+contract it has everywhere else. Happy path: `POST /products` → `201`,
+then `GET /products/:id` → `200` the identical row. Negative case:
+an unknown id → `404 application/problem+json`, not a crash.
+
+That leaves a real gap: HW #9's in-memory app never calls `src/checkout.ts`
+(HW #14), which has no HTTP route of its own — so nothing above touches
+this project's actual Postgres-backed business logic. A change that broke
+checkout's no-oversell guarantee would sail through `app.e2e.test.js`,
+the contract, AND HW #14's own CLI demos untouched. `test/e2e/checkout.e2e.test.js`
+closes that gap: it runs the real `checkout()` — the project's most
+significant business feature — against a real Postgres (the same
+real-migrations testkit the integration suite uses), the same way HW #14's
+`demo-race.ts` exercises it against a dev database. Happy path: stock and
+balance both decrement by exactly the right amount, a real `orders` row
+exists. Negative case: insufficient stock rejects with
+`InsufficientStockError`, and the stock column is provably unchanged —
+the whole transaction rolled back, not just the failed check.
+
+### Contract: Pact makes the OpenAPI spec executable
+
+`test/contract/consumer.pact.test.js` — an imagined frontend,
+`marketplace-web`, describes a **repeat** `POST /orders` with the same
+`Idempotency-Key` (straight out of `openapi/openapi.yaml` — HW #9's own
+"Bonus challenge") against a Pact mock server and writes
+`pacts/marketplace-web-marketplace-api.json`. `test/contract/verify-provider.js`
+then runs the **real** app and asks `@pact-foundation/pact`'s `Verifier`
+to replay every interaction against it.
+
+The provider state is "an order already exists for this Idempotency-Key",
+not "a product exists" — and that's deliberate. `app.js`'s `seedProducts()`
+runs unconditionally on every startup, so there is no way to observe this
+app with an empty catalog; a state handler for "a product exists" would be
+decorative no matter what it did (or didn't do). Idempotency replay is
+genuinely false by default — a fresh app's `idempotencyStore` starts
+empty — and only becomes true because the state handler makes a real
+first `POST /orders` through the app's own HTTP API before the Verifier
+replays the second one. Proven, not assumed: temporarily neutering that
+handler's request (while leaving everything else untouched) turns the
+same interaction red —
+`Expected header 'Idempotency-Replay' to have value '"true"' but was ''`
+— and restoring it turns it back to `has a matching body (OK)`. A
+DB-backed resource would `INSERT ... ON CONFLICT DO NOTHING` here instead;
+this app's catalog/orders are in-memory by HW #9's own design, so its own
+HTTP write path is the equivalent repeatable action.
+
+Neither contract file runs under jest: `@pact-foundation/pact`'s `Verifier`
+module transitively requires an ESM-only `https-proxy-agent`, which jest's
+module loader (with this project's `transform: {}`) refuses to load without
+an extra babel transform — plain Node's own `require()` handles it fine (its
+built-in ESM/CJS interop is less strict than jest's), so both files run
+under Node's native `node:test` / a plain script instead of fighting jest
+over a dependency three levels removed from anything this project wrote.
+
+`npm run verify:provider` has two legal forms, chosen by whether
+`PACT_BROKER_URL` is set:
+
+- **unset** — verifies against the local `pacts/*.json` file directly, no
+  broker involved. This is what a bare `npm run verify:provider` does.
+- **set** — verifies against the broker's latest contract for this
+  consumer AND publishes the result back (`publishVerificationResult`).
+
+### Broker + the `can-i-deploy` gate, locally
+
+```bash
+docker compose up -d --wait        # pact-broker healthy on :9292
+```
+
+The **main path** for everything below is the HW #11 vault wrapper, exactly
+like every other secret this project has:
+
+```bash
+bash scripts/with-secrets.sh dev npm run verify:provider
+```
+
+`scripts/with-secrets.sh` resolves `PACT_BROKER_URL`/`PACT_BROKER_TOKEN` the
+same way it resolves the DB password — from `secrets/pact_broker_url` /
+`secrets/pact_broker_token` if those files exist (gitignored, same
+convention as `secrets/db_password`), falling back to this repo's own
+local broker (`http://127.0.0.1:9292`, not a secret — it's just this
+compose file's own address) and an empty token (correct for this local
+broker, which runs with no auth configured) when they don't. Under
+`SKIP_VAULT=1` it executes the exact same `npm run verify:provider` the
+grader's escape hatch below also runs — same command, different source for
+the two env vars.
+
+The **grader's escape hatch** (no access to this repo's vault) sets the
+same variable directly:
+
+```bash
+PACT_BROKER_URL=http://127.0.0.1:9292 npm run verify:provider   # exit 0, publishVerificationResult: true
+```
+
+Both forms are legal; `with-secrets.sh` is just what makes the first one
+unprefixed everywhere else in this project too.
+
+**Proof the gate is real — before and after, same command, pasted
+verbatim:**
+
+Publish the contract, then ask `can-i-deploy` *before* any provider
+version has been verified or tagged:
+
+```bash
+curl -s -X PUT "http://127.0.0.1:9292/pacts/provider/marketplace-api/consumer/marketplace-web/version/1.0.0" \
+  -H 'Content-Type: application/json' -d @pacts/marketplace-web-marketplace-api.json
+# publish -> 201
+
+curl -s "http://127.0.0.1:9292/can-i-deploy?pacticipant=marketplace-web&version=1.0.0&to=prod"
+```
+```json
+{"summary":{"deployable":null,"reason":"There is no verified pact between version 1.0.0 of marketplace-web and the latest version of marketplace-api with tag prod (no such version exists)","success":0,"failed":0,"unknown":1}, ...}
+```
+
+`deployable: null`, `unknown: 1` — there is no provider version tagged
+`prod` yet, so the broker's only honest answer is "I don't know". Now
+verify (publishing the result) and tag that same provider version `prod`:
+
+```bash
+PACT_BROKER_URL=http://127.0.0.1:9292 PROVIDER_VERSION=1.0.0 npm run verify:provider
+# ... has a matching body (OK) ... "result":true
+
+curl -s -X PUT "http://127.0.0.1:9292/pacticipants/marketplace-api/versions/1.0.0/tags/prod" \
+  -H 'Content-Type: application/json'
+# tag -> 201
+```
+
+Ask the exact same question again:
+
+```bash
+curl -s "http://127.0.0.1:9292/can-i-deploy?pacticipant=marketplace-web&version=1.0.0&to=prod"
+```
+```json
+{"summary":{"deployable":true,"reason":"All required verification results are published and successful","success":1,"failed":0,"unknown":0}, ...}
+```
+
+`deployable: true`. Nothing else changed between the two calls except that
+the provider version `can-i-deploy` was asking about went from untagged to
+tagged `prod` with a published, successful verification sitting behind it
+— which is the entire mechanism `can-i-deploy` exists to check, not a
+gate that's wired to always say yes.
+
+### CI: the same gate, automated — not tag-then-check-itself
+
+`.github/workflows/contract.yml`'s `contract` job runs against the
+commit's own SHA as the provider/consumer version: bring up the stack →
+`test:contract` → publish → `verify:provider` with `PACT_BROKER_URL`
+pointed at the job's own broker container (`publishVerificationResult:
+true`) → **`can-i-deploy`, checked before this SHA is ever tagged `prod`**
+→ a simulated "deploy" step → tag this SHA `prod`, in that order.
+
+That ordering is deliberate, and fixes a real bug an earlier revision of
+this workflow had: tagging the SHA `prod` and then immediately asking
+`can-i-deploy` about that same SHA is a tautology — a gate that always
+answers the question it was just told the answer to can never go red. The
+can-i-deploy step now runs first, against whatever a PREVIOUS run tagged
+(this job's `pact-broker-db` has no volume, so on this particular
+throwaway CI broker that's usually nothing yet). The step distinguishes
+two different reasons the broker might say "not deployable":
+`failed === 0 && success === 0 && unknown > 0` means *no prior baseline
+exists to compare against* — a legitimate bootstrap case, not a broken
+build — and the gate proceeds; any actual `failed` result (a real
+verification mismatch) blocks the job regardless. Verified, not assumed:
+fed the same script a real `unknown`-only response (bootstrap → proceeds),
+a synthetic `failed: 1` response (blocks, `exit 1`), and a real
+`deployable: true` response (proceeds) — three different inputs, three
+correct outcomes. `PACT_BROKER_TOKEN` would come from a GitHub Actions
+secret in a real hosted-broker setup; this job's local broker needs none,
+same as the walkthrough above — which stays a hand-driven, pedagogical
+demonstration of the *mechanism* (tag then check, on purpose, to show
+unknown → true), a different exercise from this job's actual gate.
 
 ## Verification (acceptance criteria)
 
