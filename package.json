@@ -1,7 +1,7 @@
 {
   "name": "marketplace-api",
   "version": "1.0.0",
-  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16)",
+  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16) + realtime WebSocket/SSE (HW #18) + async events over RabbitMQ (HW #19)",
   "main": "app.js",
   "scripts": {
     "start": "npm run build --silent && node app.js",
@@ -30,12 +30,16 @@
     "test:e2e": "npm run build --silent && jest --config jest.e2e.config.js",
     "test:contract": "node --test test/contract/consumer.pact.test.js",
     "verify:provider": "npm run build --silent && node test/contract/verify-provider.js",
-    "test": "echo \"no automated tests for variant B — see README, Verification section\" && exit 0"
+    "test": "echo \"no automated tests for variant B — see README, Verification section\" && exit 0",
+    "demo:publish": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/events/demo-publish.js",
+    "demo:dlq": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/events/demo-dlq.js",
+    "demo:duplicate": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/events/demo-duplicate.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "amqplib": "^2.2.0",
     "dotenv": "^17.4.2",
     "express": "^4.22.2",
     "express-openapi-validator": "^5.6.2",

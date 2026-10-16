@@ -25,7 +25,12 @@ makes HW #9's spec executable — verified against a real broker, with
 HW #18 adds a realtime layer on top of HW #14's status changes: a
 WebSocket gateway and an SSE stream off one shared event bus, proven with
 a headless room-isolation demo that has its own built-in control run. See
-[Realtime](#realtime-hw-18) below.
+[Realtime](#realtime-hw-18) below. HW #19 puts a durable broker
+(RabbitMQ) behind that same checkout — at-least-once delivery, a
+dead-letter queue as its own contour, and an idempotent effect that
+together add up to an exactly-once *result*, proven by a demo that
+causes a real process crash mid-delivery. See
+[Async events](#async-події-через-rabbitmq-hw-19) below.
 
 ## Quickstart for the grader
 
@@ -106,6 +111,12 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `src/realtime/orders.gateway.ts` | `attachOrdersGateway()` — socket.io room join (with the ownership guard) + room-scoped emit |
 | `src/realtime/orders.controller.ts` | `createOrderEventsSseHandler()` — the SSE route, `id:`/`Last-Event-ID` included |
 | `scripts/realtime-demo.mjs` | headless room-isolation demo + its own `--same-room` control run |
+| `src/events/topology.ts` | exchange/queue/binding + DLX + alternate-exchange — declared by the consumer side, never the publisher |
+| `src/events/publisher.ts` | `publishOrderPlaced()` — confirm-channel publish, deterministic `eventId` |
+| `src/events/consumer.ts` | manual-ack consumer: `ack` strictly after the effect, `prefetch` required, poison/crash hooks for the demos |
+| `src/events/consumer-worker.ts` | standalone CLI consumer — spawned as its own OS process so `demo:duplicate`'s crash is a real `kill -9` |
+| `src/events/effect.ts` | the idempotent effect (`INSERT … ON CONFLICT DO NOTHING`), in Postgres — survives a consumer restart, a `Set` wouldn't |
+| `src/events/demo-publish.ts` / `demo-dlq.ts` / `demo-duplicate.ts` | `npm run demo:publish` / `demo:dlq` / `demo:duplicate` |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -358,6 +369,14 @@ sleep 1
 node scripts/realtime-demo.mjs;             echo "exit=$?"
 node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
 kill %1
+
+# HW #19 — async events over RabbitMQ (needs both db AND rabbitmq, already
+# part of the same `docker compose up -d --wait` above; BROKER_URL — note
+# the AMQP port, 5672, not the 15672 management-UI port)
+export BROKER_URL=amqp://app:app@127.0.0.1:5672
+npm run demo:publish
+npm run demo:dlq
+npm run demo:duplicate
 ```
 
 (Port `6432`, not `5433` — every one of the commands above (`migrate`
@@ -1070,6 +1089,144 @@ in order, no gaps, no duplicates.
 `@socket.io/redis-adapter` (Лекція 23, крок 7), який через Redis pub/sub
 синхронізує членство в кімнатах і емітовані події між усіма інстансами,
 так що `to(room)` знову працює як один спільний сервер.
+
+## Async-події через RabbitMQ (HW #19)
+
+HW #18 delivered a status change to whoever was connected *right now*; if
+nobody was, the event just didn't exist for them. RabbitMQ sits between
+`checkout()` (HW #14's own transactional checkout, the real business
+operation this event comes from) and whoever reads it, holding the
+message until a reader shows up — which is the one thing a transport
+alone (WebSocket, SSE) can never do.
+
+### Topology
+
+`src/events/topology.ts`, declared by the **consumer/bootstrap side**
+(every demo script, never the publisher — `src/events/publisher.ts` only
+ever needs an exchange name and a routing key, not a list of who's
+listening): a topic exchange `shop.events`, a quorum queue `order.placed`
+bound to it, a DLX exchange + `order.placed.dlq` queue, and an alternate
+exchange catching anything `shop.events` can't route (the cheap, one-time
+fix for "positive confirm, message silently gone" when no binding
+matches — see that file's own comment). Quorum, not classic: `x-delivery-
+limit` — one of the four legal dead-letter reasons — only exists on
+quorum queues, and classic mirroring (`ha-mode`) is gone as of RabbitMQ
+4.0 anyway.
+
+### Publish, with confirms
+
+`publishOrderPlaced()` builds a deliberately designed contract —
+`eventId`, `type`, `occurredAt`, `data` — never an ORM entity spread onto
+the wire, and publishes on a `ConfirmChannel`, awaiting
+`waitForConfirms()`. `eventId` defaults to `order.placed:<orderId>`, not
+a fresh random id per call — stable across any future retry of the same
+business operation (an outbox replay, HW #22), which is exactly what the
+consumer needs to recognize a duplicate by.
+
+`checkout()` (`src/checkout.ts`) takes an optional `publish` callback,
+called **after** its transaction commits, never from inside it —
+publishing inside the transaction would announce "order placed" before
+Postgres has actually committed, and a rollback after that point could
+never be taken back. This HW doesn't claim to close that gap atomically
+(a publish failing right after a successful commit is real and open) —
+that's a transactional outbox, named here as HW #22's job, not quietly
+assumed away.
+
+### Consumer: manual ack, after the effect, prefetch justified
+
+`src/events/consumer.ts`: `noAck: false`, and `channel.ack()` happens
+strictly after the effect has committed — never before. That ordering
+*is* the whole lesson: ack early, then crash, and the work before the
+crash is gone; ack late (or not at all), and the broker redelivers —
+possibly after the effect already landed. One sequential block, not
+split across callbacks where the order could drift.
+
+**prefetch = 10**, justified by `prefetch × time-per-message <
+consumer_timeout` (the stock 30 minutes): this consumer's effect is a
+single `INSERT ... ON CONFLICT`, single-digit milliseconds, so
+`10 × ~0.01 s ≈ 0.1 s` — nowhere near the ceiling. The library's own
+default is 0 (unlimited), which isn't a cautious default — it's "the
+first subscribed consumer claims the entire queue, every other consumer
+starves."
+
+### DLQ as its own contour
+
+A poison message (`data.poison === true` in this demo, a malformed
+payload or an unsatisfiable business rule in reality) gets
+`channel.reject(msg, false)` — straight to the DLX, reason `rejected`,
+not a retry loop (that's `requeue=true`, which is what `x-delivery-limit`
+in the topology guards against separately). `npm run demo:dlq` reads the
+reason back from `x-first-death-reason`, then puts the message back with
+`nack(msg, false, true)` — a peek, not a consume, so the queue depth it
+just reported stays true after the script exits.
+
+### Idempotent effect, not in-memory dedup
+
+`src/events/effect.ts`: `INSERT INTO processed_order_events (event_id, …)
+… ON CONFLICT (event_id) DO NOTHING` — the natural key IS the dedup, not
+a counter a duplicate would happily decrement twice. A `Set` in the
+consumer process's own memory would not have survived the crash
+`demo:duplicate` below deliberately causes — the guarantee has to live in
+the same place the data does, Postgres, or it isn't a guarantee across a
+restart at all. A second, separate table (`order_event_deliveries`)
+records every delivery including duplicates — not part of the dedup
+decision, only so the demo can prove a redelivery actually happened.
+
+### The three demos, this run's real numbers
+
+```
+npm run demo:publish
+# published=5
+# delivered=5
+# effect=5
+# acked=5
+# dlq=0
+# prefetch=10
+
+npm run demo:dlq
+# rejected=1
+# work=0
+# dlq=1
+# dlq-reason=rejected
+# effect=0
+
+npm run demo:duplicate
+# deliveries=2
+# effect=1
+```
+
+`demo:duplicate`'s redelivery is a **real `kill -9`** on a **separate
+child process** (`src/events/consumer-worker.ts`, spawned via
+`child_process.spawn`), fired right after that process applies the
+effect but before it acks — not `channel.close()`. A clean close also
+requeues the unacked message, but it's a graceful shutdown; what actually
+happens in prod at 3am is the process disappearing out from under an
+open TCP connection, and only a real process death demonstrates that.
+RabbitMQ detects the dropped connection and redelivers to the second,
+freshly-spawned worker, which applies the (now idempotent, no-op) effect
+again and acks normally — `deliveries=2`, `effect=1`.
+
+### Why this is at-least-once, not exactly-once — and what makes the result exactly-once anyway
+
+**Exactly-once delivery does not exist, here or anywhere.** What exists
+is **at-least-once delivery** (a message is redelivered whenever its fate
+— did the ack arrive? — is unknown, which is the only safe default) **plus
+an idempotent effect**, and together the two produce an **exactly-once
+result** — not because any single delivery is guaranteed unique, but
+because a duplicate delivery is guaranteed to be a no-op. `ack` doesn't
+mean "this arrived"; it means "I no longer require a retry". Confirm that
+too early (`autoAck`, or an ack before the effect) and a crash in the
+window loses the work outright; confirm it too late (or an ack that never
+arrives, as in `demo:duplicate`) and the broker redelivers — there is no
+third option. `demo:duplicate` is the one place in this HW where that's
+visible with real numbers, not asserted: `deliveries=2`, `effect=1`.
+
+One boundary this HW deliberately does NOT close: the gap between
+"marked processed" and "applied the effect" is today two separate
+statements, not one transaction — falling exactly between them (marked,
+but the effect never happened) is a real, open possibility. Closing it
+takes a shared transaction (the mark and the effect, one `COMMIT`, one
+database) — HW #22's job, named here rather than assumed solved.
 
 ## Verification (acceptance criteria)
 
