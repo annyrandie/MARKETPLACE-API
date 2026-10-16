@@ -78,6 +78,40 @@ describe('E2E (data layer): the real checkout() against a real Postgres', () => 
     expect(orderRows[0].total_amount_cents).toBe(4000);
   });
 
+  // HW #19: checkout() takes an optional `publish` callback, called AFTER
+  // the transaction commits — this is this project's one real caller that
+  // actually exercises that wiring end to end. Every HW #19 demo script
+  // calls publishOrderPlaced() directly against a hand-built event
+  // instead, so without this test nothing in the repo would ever catch a
+  // typo in checkout.ts's own field mapping (orderId/userId/totalCents/…)
+  // or a publish that fired before the row was actually committed.
+  test('calls the optional publish callback once, after commit, with the real order data', async () => {
+    const userId = await insertUser(100000);
+    const productId = await insertProduct(5, 2000);
+
+    const publishedEvents = [];
+    const publish = async (data) => {
+      // If this ran before commit, the row wouldn't be visible yet on
+      // this SEPARATE connection (pg.pool, not the transaction's own) —
+      // reading it back here is what actually proves "after", not just
+      // "awaited the same promise chain".
+      const { rows } = await pg.pool.query('SELECT total_amount_cents FROM orders WHERE id = $1', [data.orderId]);
+      publishedEvents.push({ data, orderVisibleAfterCommit: rows.length === 1 });
+    };
+
+    const result = await checkoutModule.checkout(AppDataSource, userId, productId, 3, publish);
+
+    expect(publishedEvents).toHaveLength(1);
+    expect(publishedEvents[0].orderVisibleAfterCommit).toBe(true);
+    expect(publishedEvents[0].data).toMatchObject({
+      orderId: result.orderId,
+      userId,
+      productId,
+      quantity: 3,
+      totalCents: result.totalCents,
+    });
+  });
+
   test('negative case: insufficient stock rejects, and nothing partially commits', async () => {
     const userId = await insertUser(100000);
     const productId = await insertProduct(1, 2000);
