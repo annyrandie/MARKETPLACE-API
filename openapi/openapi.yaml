@@ -229,7 +229,12 @@ paths:
         OpenAPI validator middleware, the same way `/health` is (see
         app.js's own comment) — documented here for completeness, not
         enforced by express-openapi-validator. Supports `Last-Event-ID` for
-        resuming after a reconnect; see README's Testing section.
+        resuming after a reconnect; see README's Testing section. If the
+        order has an owner (set at creation via `X-User-Id`), that same
+        header is required here too and must match, same rule the
+        WebSocket join enforces for the equivalent room — an order with no
+        recorded owner has none of this to check and streams openly, same
+        as plain `GET /orders/{orderId}` already does for it.
       parameters:
         - $ref: '#/components/parameters/OrderId'
       responses:
@@ -242,6 +247,8 @@ paths:
             text/event-stream:
               schema:
                 type: string
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -296,6 +303,13 @@ components:
 
     NotFound:
       description: No resource with this id exists
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    Forbidden:
+      description: The resource exists but does not belong to the caller
       content:
         application/problem+json:
           schema:

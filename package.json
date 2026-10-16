@@ -4,8 +4,8 @@
   "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16)",
   "main": "app.js",
   "scripts": {
-    "start": "node app.js",
-    "start:dev": "node --watch app.js",
+    "start": "npm run build --silent && node app.js",
+    "start:dev": "npm run build --silent && node --watch app.js",
     "check:env": "node scripts/check-env-example.mjs",
     "db:up": "bash scripts/up-db.sh",
     "db:rotate": "bash rotate.sh",

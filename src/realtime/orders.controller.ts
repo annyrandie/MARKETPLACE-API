@@ -8,13 +8,27 @@
 import { OrderEventsService, OrderStatusEvent } from './order-events.service';
 import { OrderLookup } from './orders.gateway';
 
+// Same shape app.js's ProblemError has ({status, message}) — not that
+// class itself: app.js requires the COMPILED version of this file at
+// module-load time (see its own header comment), so importing app.js's
+// ProblemError back from here would be a circular require. app.js's
+// single error-handling middleware only ever reads `.status`/`.message`
+// off whatever reaches `next(err)`, so a plain Error with `.status` set
+// funnels into the exact same RFC 7807 problem+json response as every
+// other error in this app — not a bare `res.status(...).end()` with no
+// body and no Content-Type, which was this route's one inconsistency
+// with the rest of the API's single error contract.
+function problem(status: number, message: string): Error & { status: number } {
+  return Object.assign(new Error(message), { status });
+}
+
 export function createOrderEventsSseHandler(events: OrderEventsService, getOrder: OrderLookup) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (req: any, res: any): void => {
+  return (req: any, res: any, next: (err?: unknown) => void): void => {
     const { orderId } = req.params;
     const order = getOrder(orderId);
     if (!order) {
-      res.status(404).end();
+      next(problem(404, `Order "${orderId}" was not found`));
       return;
     }
     // Ownership is enforced only when the order actually HAS an owner.
@@ -30,7 +44,7 @@ export function createOrderEventsSseHandler(events: OrderEventsService, getOrder
     if (order.userId) {
       const userId = req.get('X-User-Id');
       if (!userId || order.userId !== userId) {
-        res.status(403).end();
+        next(problem(403, `"${orderId}" does not belong to the caller`));
         return;
       }
     }
@@ -65,5 +79,13 @@ export function createOrderEventsSseHandler(events: OrderEventsService, getOrder
 
     const unsubscribe = events.subscribe(orderId, writeEvent);
     req.on('close', unsubscribe);
+    // A clean disconnect fires 'close' on req; a reset/timed-out one can
+    // instead make a later res.write() emit 'error' on the response
+    // stream — with no listener, that's an unhandled EventEmitter error,
+    // fatal to the whole process by default (the same class of bug
+    // container.js's own header comment documents fixing for a dropped DB
+    // connection). One flaky long-lived SSE client must not be able to
+    // take the server down.
+    res.on('error', unsubscribe);
   };
 }

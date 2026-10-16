@@ -11,7 +11,7 @@ import { OrderEventsService } from './order-events.service';
 
 export interface OwnedOrder {
   id: string;
-  userId: string;
+  userId: string | null;
 }
 
 export type OrderLookup = (orderId: string) => OwnedOrder | undefined;
@@ -27,7 +27,16 @@ export function attachOrdersGateway(
   events: OrderEventsService,
   getOrder: OrderLookup,
 ): SocketIoServer {
-  const io = new SocketIoServer(httpServer, { cors: { origin: '*' } });
+  // No CORS config: realtime-demo.mjs is a Node process (socket.io-client
+  // outside a browser never enforces CORS at all), and this app has no
+  // browser-facing cross-origin client of its own. An earlier revision
+  // set `cors: { origin: '*' }` out of socket.io-boilerplate habit — that
+  // explicitly opened cross-origin WebSocket access this app's REST and
+  // SSE surfaces don't have (neither sets any CORS header, so a browser's
+  // own same-origin policy is what protects them by default); removing it
+  // closes that mismatch instead of giving WS a wider cross-origin
+  // exposure than the "equivalent" transport next to it.
+  const io = new SocketIoServer(httpServer);
 
   io.on('connection', (socket) => {
     // Identity is read ONCE, at connection time, from the handshake — not
@@ -46,12 +55,21 @@ export function attachOrdersGateway(
       const orderId = payload?.orderId;
       const order = typeof orderId === 'string' ? getOrder(orderId) : undefined;
 
-      // Anonymous (no userId) or someone else's order (userId doesn't
-      // match the owner on record) are both refused the same way: the
-      // socket never joins the room, so it can never receive that order's
-      // events through this connection.
-      if (!order || !userId || order.userId !== userId) {
-        ack?.({ ok: false, reason: order ? 'forbidden' : 'not_found' });
+      if (!order) {
+        ack?.({ ok: false, reason: 'not_found' });
+        return;
+      }
+      // Ownership is enforced only when the order actually HAS an owner
+      // — same rule orders.controller.ts's SSE route uses, for the same
+      // reason: an order created without X-User-Id has no owner to check
+      // against and is already public via plain GET /orders/:id, so
+      // refusing every joiner for it (an earlier revision did exactly
+      // that, unconditionally) made WebSocket the one transport that was
+      // STRICTER than the "equivalent" SSE stream for the identical
+      // resource, not just differently guarded. Someone else's order —
+      // one that DOES have an owner — is still refused exactly as before.
+      if (order.userId && order.userId !== userId) {
+        ack?.({ ok: false, reason: 'forbidden' });
         return;
       }
 
