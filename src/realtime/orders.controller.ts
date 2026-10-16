@@ -17,15 +17,22 @@ export function createOrderEventsSseHandler(events: OrderEventsService, getOrder
       res.status(404).end();
       return;
     }
-    // Same ownership rule the WebSocket join uses (orders.gateway.ts) —
-    // without this, SSE was a second, unguarded door onto the exact data
-    // the WS gateway was busy refusing: anyone who knew an order id could
-    // GET its event stream with no identity at all. `X-User-Id` is the
-    // same header POST /orders already reads when creating the order.
-    const userId = req.get('X-User-Id');
-    if (!userId || order.userId !== userId) {
-      res.status(403).end();
-      return;
+    // Ownership is enforced only when the order actually HAS an owner.
+    // An order created without X-User-Id (POST /orders never required it,
+    // before or after this HW) is already fully public — GET /orders/:id
+    // returns its status to anyone, no header needed — so its event
+    // stream being equally open isn't a new leak, just the same resource
+    // over a different transport. What WAS a real gap: an order that DOES
+    // have a recorded owner got the same open 200 here that an anonymous
+    // one does, even though the WebSocket join (orders.gateway.ts) was
+    // correctly refusing anyone but that owner for the identical room.
+    // `X-User-Id` is the same header POST /orders already reads.
+    if (order.userId) {
+      const userId = req.get('X-User-Id');
+      if (!userId || order.userId !== userId) {
+        res.status(403).end();
+        return;
+      }
     }
 
     res.writeHead(200, {

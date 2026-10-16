@@ -1005,28 +1005,37 @@ not invent:
   `orders.controller.ts` only ever learn about it by subscribing, the same
   as any other listener would.
 - **No ownership concept existed.** In-memory orders had no owner field at
-  all. `POST /orders` now reads an `X-User-Id` header (optional — an order
-  created without one just can't be watched by anyone, not a behavior
-  change for anyone who doesn't use this feature); both transports check
-  it against the order on record — missing, mismatched, or unknown order
-  are all refused the same way, on the WebSocket join AND on the SSE GET
-  (an earlier revision only guarded the former, leaving the latter a
-  second, unguarded door onto the same events). `userId` never appears in
-  any HTTP response; it's this feature's own bookkeeping, not part of the
-  documented `Order` schema. For the WebSocket side specifically, identity
-  is read once from the socket's handshake (`socket.handshake.auth.userId`,
-  set via `io(url, { auth: { userId } })`), not from the `join` message's
-  own payload — a per-message field would let one connection claim a
-  different userId on every join call and probe ownership one guess at a
-  time; pinning it to the handshake ties one identity to one connection
-  for its whole lifetime.
+  all, and `GET /orders/:id` has never required one — it returns any
+  order's status to anyone, no header needed. `POST /orders` now
+  optionally reads an `X-User-Id` header; an order created without one
+  stays exactly as public as it always was (not a behavior change for
+  anyone who doesn't use this feature), on both transports. An order
+  created **with** one is where the rule actually bites: the WebSocket
+  `join` always requires a matching identity (an anonymous joiner is
+  refused even for an ownerless order — "anonymous... refused" is this
+  HW's own wording for that transport specifically); the SSE `GET` enforces
+  the same match **only when the order has an owner to match against** —
+  an earlier revision enforced nothing on SSE at all, which was a real
+  gap (an *owned* order's stream was wide open while the identical room's
+  WebSocket join correctly refused it); enforcing it unconditionally would
+  have been a different bug the other way, breaking this feature's own
+  base case of an anonymously-created order's stream staying exactly as
+  open as its REST representation already is. `userId` never appears in
+  any HTTP response regardless; it's this feature's own bookkeeping, not
+  part of the documented `Order` schema. For the WebSocket side
+  specifically, identity is read once from the socket's handshake
+  (`socket.handshake.auth.userId`, set via `io(url, { auth: { userId } })`),
+  not from the `join` message's own payload — a per-message field would
+  let one connection claim a different userId on every join call and
+  probe ownership one guess at a time; pinning it to the handshake ties
+  one identity to one connection for its whole lifetime.
 
 ### Last-Event-ID, proven with 5 real events
 
-SSE enforces the same ownership rule as the WebSocket join (see above) —
-every example below passes the same `X-User-Id` the order was created
-with; omitting it, or sending a different one, gets `403` instead of a
-stream.
+`order_1` below was created **with** `X-User-Id: tester` (see
+[No ownership concept existed](#no-nest-here-either) just above), so its
+stream enforces that owner — an anonymously-created order's stream would
+need no header at all.
 
 ```
 curl -sN --max-time 2 -H 'Last-Event-ID: 3' -H 'X-User-Id: tester' http://localhost:3000/orders/order_1/events | grep '^id:'
