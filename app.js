@@ -2,12 +2,16 @@ require('dotenv/config');
 
 const path = require('node:path');
 const crypto = require('node:crypto');
+const http = require('node:http');
 const { readFile } = require('node:fs/promises');
 const { STATUS_CODES } = require('node:http');
 const express = require('express');
 const OpenApiValidator = require('express-openapi-validator');
 const { Pool } = require('pg');
 const { validate } = require('./src/config/env.schema');
+const { OrderEventsService } = require('./dist/realtime/order-events.service');
+const { attachOrdersGateway } = require('./dist/realtime/orders.gateway');
+const { createOrderEventsSseHandler } = require('./dist/realtime/orders.controller');
 
 // Fail-fast: either the process starts with a fully valid config, or it
 // doesn't start at all — and says in plain language which variable is
@@ -60,6 +64,26 @@ pool.on('error', (err) => {
 const products = new Map();
 const orders = new Map();
 const idempotencyStore = new Map(); // Idempotency-Key -> { bodyHash, status, response }
+
+// HW #18: one event bus, two transports. Shared at module scope (same
+// lifetime as `orders` above) so the SSE route in createApp() and the
+// WebSocket gateway attached in createHttpServer() — two separate pieces
+// of wiring — subscribe to the exact same instance, not two independent
+// copies that could drift.
+const orderEvents = new OrderEventsService();
+
+function getOwnedOrder(orderId) {
+  const order = orders.get(orderId);
+  return order ? { id: order.id, userId: order.userId } : undefined;
+}
+
+// `order.userId` is this feature's own bookkeeping (HW #18) — not part of
+// the documented Order schema (openapi/openapi.yaml), so every response
+// strips it before serializing instead of leaking an undocumented field.
+function toPublicOrder(order) {
+  const { userId, ...publicOrder } = order; // eslint-disable-line no-unused-vars
+  return publicOrder;
+}
 
 let nextProductSeq = 1;
 let nextOrderSeq = 1;
@@ -171,6 +195,16 @@ function createApp() {
     }
   });
 
+  // Same reason /health is registered before the validator: this is a
+  // long-lived text/event-stream connection, never a single JSON response
+  // to validate against a schema — express-openapi-validator has nothing
+  // useful to check here. Documented in openapi/openapi.yaml anyway, for
+  // discoverability, just not enforced there (see that path's own comment).
+  // getOwnedOrder, not a bare existence check: the handler enforces the
+  // same ownership rule the WebSocket join does (X-User-Id must match)
+  // — this used to be the one door onto order events that checked nothing.
+  app.get('/orders/:orderId/events', createOrderEventsSseHandler(orderEvents, getOwnedOrder));
+
   app.use(express.json());
 
   app.use(
@@ -203,7 +237,8 @@ function createApp() {
 
   app.get('/orders', (req, res) => {
     const sorted = Array.from(orders.values()).sort(compareByKeyset);
-    res.json(paginate(sorted, req));
+    const page = paginate(sorted, req);
+    res.json({ ...page, items: page.items.map(toPublicOrder) });
   });
 
   app.post('/orders', (req, res, next) => {
@@ -236,17 +271,27 @@ function createApp() {
         0,
       );
 
+      // HW #18: an order's "owner", for the WebSocket join guard
+      // (orders.gateway.ts) to check against — not part of the documented
+      // request body (NewOrder has additionalProperties: false), so it
+      // travels as a header instead, the same place Idempotency-Key does.
+      // No X-User-Id at all just means this order has no one who can join
+      // its realtime room — anonymous order creation still works exactly
+      // as before this HW, same as it always has.
+      const userId = req.headers['x-user-id'] || null;
+
       const order = {
         id: `order_${nextOrderSeq++}`,
         status: 'created',
         items: req.body.items,
         total_cents,
         created_at: new Date().toISOString(),
+        userId,
       };
       orders.set(order.id, order);
-      idempotencyStore.set(idempotencyKey, { bodyHash, status: 201, response: order });
+      idempotencyStore.set(idempotencyKey, { bodyHash, status: 201, response: toPublicOrder(order) });
 
-      res.status(201).json(order);
+      res.status(201).json(toPublicOrder(order));
     } catch (err) {
       next(err);
     }
@@ -257,7 +302,22 @@ function createApp() {
     if (!order) {
       return next(new ProblemError(404, `Order "${req.params.orderId}" was not found`));
     }
-    res.json(order);
+    res.json(toPublicOrder(order));
+  });
+
+  // HW #18: the "existing endpoint that changes order status" the realtime
+  // layer hooks into. Emits from THIS business logic, not from a
+  // controller calling the gateway/SSE transport directly — orders.gateway.ts
+  // and orders.controller.ts only ever learn about a status change by
+  // subscribing to orderEvents, the same as any other subscriber would.
+  app.patch('/orders/:orderId/status', (req, res, next) => {
+    const order = orders.get(req.params.orderId);
+    if (!order) {
+      return next(new ProblemError(404, `Order "${req.params.orderId}" was not found`));
+    }
+    order.status = req.body.status;
+    orderEvents.emitStatusChange(order.id, order.status);
+    res.json(toPublicOrder(order));
   });
 
   // Single funnel for every error in the chain — domain, express-openapi-validator,
@@ -285,10 +345,24 @@ function createApp() {
   return app;
 }
 
-module.exports = { createApp };
+// HW #18: socket.io needs the raw http.Server, not the Express app —
+// `app.listen(...)` (what every earlier HW used) creates one internally
+// and never hands it back. Separate from createApp() on purpose: tests
+// (app.e2e.test.js, Pact's verify-provider.js) pass the bare Express app
+// straight to supertest/listen and have no use for a WebSocket gateway —
+// this function exists only for the one real process that actually serves
+// realtime traffic (`npm start`, scripts/realtime-demo.mjs's target).
+function createHttpServer() {
+  const app = createApp();
+  const server = http.createServer(app);
+  attachOrdersGateway(server, orderEvents, getOwnedOrder);
+  return server;
+}
+
+module.exports = { createApp, createHttpServer };
 
 if (require.main === module) {
-  createApp().listen(env.PORT, () => {
-    log('info', `marketplace-api listening on http://localhost:${env.PORT}`);
+  createHttpServer().listen(env.PORT, () => {
+    log('info', `marketplace-api listening on http://localhost:${env.PORT} (WebSocket + SSE realtime enabled)`);
   });
 }

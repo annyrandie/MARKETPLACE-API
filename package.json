@@ -4,8 +4,8 @@
   "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16)",
   "main": "app.js",
   "scripts": {
-    "start": "node app.js",
-    "start:dev": "node --watch app.js",
+    "start": "npm run build --silent && node app.js",
+    "start:dev": "npm run build --silent && node --watch app.js",
     "check:env": "node scripts/check-env-example.mjs",
     "db:up": "bash scripts/up-db.sh",
     "db:rotate": "bash rotate.sh",
@@ -29,7 +29,7 @@
     "test:integration": "npm run build --silent && jest --config jest.integration.config.js",
     "test:e2e": "npm run build --silent && jest --config jest.e2e.config.js",
     "test:contract": "node --test test/contract/consumer.pact.test.js",
-    "verify:provider": "node test/contract/verify-provider.js",
+    "verify:provider": "npm run build --silent && node test/contract/verify-provider.js",
     "test": "echo \"no automated tests for variant B — see README, Verification section\" && exit 0"
   },
   "keywords": [],
@@ -41,6 +41,8 @@
     "express-openapi-validator": "^5.6.2",
     "pg": "^8.22.0",
     "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "socket.io": "^4.8.4",
     "typeorm": "^0.3.31",
     "zod": "^4.4.3"
   },
@@ -51,6 +53,7 @@
     "@types/node": "^22.20.4",
     "@types/pg": "^8.23.1",
     "jest": "^30.5.2",
+    "socket.io-client": "^4.8.4",
     "supertest": "^7.3.1",
     "typescript": "^6.0.3"
   }
