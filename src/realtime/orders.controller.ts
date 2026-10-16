@@ -6,15 +6,25 @@
 // parameter annotations isn't worth a new dependency in a project where
 // the route's own home (app.js) is plain, untyped JS anyway.
 import { OrderEventsService, OrderStatusEvent } from './order-events.service';
+import { OrderLookup } from './orders.gateway';
 
-export type OrderExists = (orderId: string) => boolean;
-
-export function createOrderEventsSseHandler(events: OrderEventsService, orderExists: OrderExists) {
+export function createOrderEventsSseHandler(events: OrderEventsService, getOrder: OrderLookup) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (req: any, res: any): void => {
     const { orderId } = req.params;
-    if (!orderExists(orderId)) {
+    const order = getOrder(orderId);
+    if (!order) {
       res.status(404).end();
+      return;
+    }
+    // Same ownership rule the WebSocket join uses (orders.gateway.ts) —
+    // without this, SSE was a second, unguarded door onto the exact data
+    // the WS gateway was busy refusing: anyone who knew an order id could
+    // GET its event stream with no identity at all. `X-User-Id` is the
+    // same header POST /orders already reads when creating the order.
+    const userId = req.get('X-User-Id');
+    if (!userId || order.userId !== userId) {
+      res.status(403).end();
       return;
     }
 
@@ -35,8 +45,13 @@ export function createOrderEventsSseHandler(events: OrderEventsService, orderExi
     // Last-Event-ID: resume exactly where this connection left off — every
     // buffered event strictly newer than what the client already has,
     // then fall through to the live subscription below for anything after.
-    const lastEventIdHeader = req.get('Last-Event-ID');
-    const lastEventId = lastEventIdHeader ? Number(lastEventIdHeader) : 0;
+    // A missing OR unparsable header (`Number(...)` on anything that
+    // isn't a clean integer, including undefined, is NaN) both mean
+    // "nothing seen yet" — `id > NaN` is false for every real id, so an
+    // unparsable header used to silently swallow the whole backlog
+    // instead of replaying it.
+    const parsedLastEventId = Number(req.get('Last-Event-ID'));
+    const lastEventId = Number.isFinite(parsedLastEventId) ? parsedLastEventId : 0;
     for (const missed of events.getEventsSince(orderId, lastEventId)) {
       writeEvent(missed);
     }

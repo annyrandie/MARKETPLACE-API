@@ -200,7 +200,10 @@ function createApp() {
   // to validate against a schema — express-openapi-validator has nothing
   // useful to check here. Documented in openapi/openapi.yaml anyway, for
   // discoverability, just not enforced there (see that path's own comment).
-  app.get('/orders/:orderId/events', createOrderEventsSseHandler(orderEvents, (orderId) => orders.has(orderId)));
+  // getOwnedOrder, not a bare existence check: the handler enforces the
+  // same ownership rule the WebSocket join does (X-User-Id must match)
+  // — this used to be the one door onto order events that checked nothing.
+  app.get('/orders/:orderId/events', createOrderEventsSseHandler(orderEvents, getOwnedOrder));
 
   app.use(express.json());
 

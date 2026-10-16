@@ -30,9 +30,20 @@ export function attachOrdersGateway(
   const io = new SocketIoServer(httpServer, { cors: { origin: '*' } });
 
   io.on('connection', (socket) => {
-    socket.on('join', (payload: { orderId?: string; userId?: string } | undefined, ack?: (res: JoinAck) => void) => {
+    // Identity is read ONCE, at connection time, from the handshake — not
+    // from the `join` payload. A payload field is just a string the
+    // client typed into the SAME message asking to join; "someone else's
+    // order" would otherwise mean nothing more than "a client that didn't
+    // guess the right userId string this one time" — it could claim a
+    // DIFFERENT userId on every join call over the same connection and
+    // probe every order's ownership one guess at a time. Pinning identity
+    // to the handshake (auth payload, same as a real session/JWT would
+    // arrive) ties exactly one identity to this socket for its whole
+    // lifetime, which is what makes "forbidden" actually mean something.
+    const userId = socket.handshake.auth?.userId ?? socket.handshake.query?.userId;
+
+    socket.on('join', (payload: { orderId?: string } | undefined, ack?: (res: JoinAck) => void) => {
       const orderId = payload?.orderId;
-      const userId = payload?.userId;
       const order = typeof orderId === 'string' ? getOrder(orderId) : undefined;
 
       // Anonymous (no userId) or someone else's order (userId doesn't

@@ -970,6 +970,14 @@ verified by stopping every container and deleting `secrets/db_password`
 outright and running both demo modes anyway. A plain `cp .env.example
 .env` is the only setup step this section needs.
 
+`scripts/realtime-demo.mjs` targets `http://localhost:3000` by default —
+override with the `REALTIME_DEMO_URL` env var if the app is listening
+somewhere else (a non-default `PORT` in `.env`, a different host):
+
+```bash
+REALTIME_DEMO_URL=http://localhost:4000 node scripts/realtime-demo.mjs
+```
+
 ### No Nest here, either
 
 The assignment's own wording (`@WebSocketGateway()`, `NestFactory.create`)
@@ -998,18 +1006,30 @@ not invent:
   as any other listener would.
 - **No ownership concept existed.** In-memory orders had no owner field at
   all. `POST /orders` now reads an `X-User-Id` header (optional — an order
-  created without one just can't be joined by anyone, not a behavior
-  change for anyone who doesn't use this feature) and the WebSocket
-  `join` handler checks it against the order on record before calling
-  `socket.join(...)` — missing, mismatched, or unknown order are all
-  refused the same way. `userId` never appears in any HTTP response; it's
-  this feature's own bookkeeping, not part of the documented `Order`
-  schema.
+  created without one just can't be watched by anyone, not a behavior
+  change for anyone who doesn't use this feature); both transports check
+  it against the order on record — missing, mismatched, or unknown order
+  are all refused the same way, on the WebSocket join AND on the SSE GET
+  (an earlier revision only guarded the former, leaving the latter a
+  second, unguarded door onto the same events). `userId` never appears in
+  any HTTP response; it's this feature's own bookkeeping, not part of the
+  documented `Order` schema. For the WebSocket side specifically, identity
+  is read once from the socket's handshake (`socket.handshake.auth.userId`,
+  set via `io(url, { auth: { userId } })`), not from the `join` message's
+  own payload — a per-message field would let one connection claim a
+  different userId on every join call and probe ownership one guess at a
+  time; pinning it to the handshake ties one identity to one connection
+  for its whole lifetime.
 
 ### Last-Event-ID, proven with 5 real events
 
+SSE enforces the same ownership rule as the WebSocket join (see above) —
+every example below passes the same `X-User-Id` the order was created
+with; omitting it, or sending a different one, gets `403` instead of a
+stream.
+
 ```
-curl -sN --max-time 2 -H 'Last-Event-ID: 3' http://localhost:3000/orders/order_1/events | grep '^id:'
+curl -sN --max-time 2 -H 'Last-Event-ID: 3' -H 'X-User-Id: tester' http://localhost:3000/orders/order_1/events | grep '^id:'
 # id: 4
 ```
 

@@ -39,14 +39,18 @@ async function setStatus(orderId, status) {
 
 function connectAndJoin(orderId, userId) {
   return new Promise((resolve, reject) => {
-    const socket = ioClient(BASE_URL, { transports: ['websocket'], reconnection: false });
+    // userId travels in the handshake (`auth`), not in the `join` payload
+    // — the gateway (orders.gateway.ts) reads identity once per
+    // connection from here, exactly so a client can't just try a
+    // different userId string per join call. See that file's comment.
+    const socket = ioClient(BASE_URL, { transports: ['websocket'], reconnection: false, auth: { userId } });
     let received = false;
     socket.on('order.status', () => {
       received = true;
     });
     socket.on('connect_error', (err) => reject(err));
     socket.on('connect', () => {
-      socket.emit('join', { orderId, userId }, (ack) => {
+      socket.emit('join', { orderId }, (ack) => {
         if (!ack?.ok) {
           reject(new Error(`join denied for order ${orderId}: ${JSON.stringify(ack)}`));
           return;
