@@ -97,5 +97,28 @@ services:
       timeout: 3s
       retries: 30
 
+  # RabbitMQ (HW #19) — the broker IS the point of this HW, not a tool
+  # borrowed to demo something else. 4.2.x: commercial-support LTS series
+  # through 2030-06-30 — the "which version did you ship" answer. The
+  # -management image, not the bare one: without it there's no UI to look
+  # at x-death headers by eye while building the DLQ demo.
+  rabbitmq:
+    image: rabbitmq:4.2-management
+    ports:
+      - '${RABBITMQ_AMQP_HOST_PORT:-5672}:5672'   # AMQP — what the app and demo scripts actually connect to
+      - '${RABBITMQ_UI_HOST_PORT:-15672}:15672'   # management UI only; NOT an AMQP port
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app
+    healthcheck:
+      # Not "is the TCP port open": there's a real window between the port
+      # accepting connections and the Erlang node actually being ready to
+      # run basic.publish, and a client landing in it gets ECONNRESET.
+      # rabbitmq-diagnostics asks the node itself whether it's up.
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'check_running']
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
 volumes:
   pgdata-restore:

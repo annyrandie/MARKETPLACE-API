@@ -78,6 +78,40 @@ describe('E2E (data layer): the real checkout() against a real Postgres', () => 
     expect(orderRows[0].total_amount_cents).toBe(4000);
   });
 
+  // HW #19: checkout() takes an optional `publish` callback, called AFTER
+  // the transaction commits. The production caller is CheckoutService
+  // (behind app.js's POST /checkout), which binds it to RabbitMQ — this
+  // test pins checkout()'s own half of that contract with no broker in
+  // the way: the field mapping (orderId/userId/totalCents/…) and that the
+  // callback only fires once the row is actually committed. The HW #19
+  // demo scripts publish hand-built events and never cover either.
+  test('calls the optional publish callback once, after commit, with the real order data', async () => {
+    const userId = await insertUser(100000);
+    const productId = await insertProduct(5, 2000);
+
+    const publishedEvents = [];
+    const publish = async (data) => {
+      // If this ran before commit, the row wouldn't be visible yet on
+      // this SEPARATE connection (pg.pool, not the transaction's own) —
+      // reading it back here is what actually proves "after", not just
+      // "awaited the same promise chain".
+      const { rows } = await pg.pool.query('SELECT total_amount_cents FROM orders WHERE id = $1', [data.orderId]);
+      publishedEvents.push({ data, orderVisibleAfterCommit: rows.length === 1 });
+    };
+
+    const result = await checkoutModule.checkout(AppDataSource, userId, productId, 3, publish);
+
+    expect(publishedEvents).toHaveLength(1);
+    expect(publishedEvents[0].orderVisibleAfterCommit).toBe(true);
+    expect(publishedEvents[0].data).toMatchObject({
+      orderId: result.orderId,
+      userId,
+      productId,
+      quantity: 3,
+      totalCents: result.totalCents,
+    });
+  });
+
   test('negative case: insufficient stock rejects, and nothing partially commits', async () => {
     const userId = await insertUser(100000);
     const productId = await insertProduct(1, 2000);
