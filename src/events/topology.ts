@@ -7,6 +7,11 @@ export const EXCHANGE = 'shop.events';
 export const ROUTING_KEY = 'order.placed';
 export const QUEUE = 'order.placed';
 
+// HW #22: the invoicing consumer's own queue on the same event — exactly
+// the "new consumer = new queue + binding" this file's header promises.
+// Both queues get every order.placed; neither knows the other exists.
+export const INVOICING_QUEUE = 'invoicing.order-placed';
+
 export const DLX_EXCHANGE = 'shop.events.dlx';
 export const DLQ = 'order.placed.dlq';
 
@@ -58,4 +63,15 @@ export async function assertTopology(channel: Channel | ConfirmChannel): Promise
     },
   });
   await channel.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY);
+
+  await channel.assertQueue(INVOICING_QUEUE, {
+    durable: true,
+    arguments: {
+      'x-queue-type': 'quorum',
+      'x-dead-letter-exchange': DLX_EXCHANGE,
+      'x-dead-letter-routing-key': ROUTING_KEY,
+      'x-delivery-limit': 5,
+    },
+  });
+  await channel.bindQueue(INVOICING_QUEUE, EXCHANGE, ROUTING_KEY);
 }

@@ -1,6 +1,7 @@
 // The transactional checkout: decrement stock, decrement the buyer's
-// balance, record the order, and queue a post-processing task — one
-// transaction, one connection, all-or-nothing.
+// balance, record the order, queue a post-processing task, and (HW #22)
+// write the order.placed event to the outbox — one transaction, one
+// connection, all-or-nothing.
 //
 // Oversell protection: an atomic `UPDATE ... WHERE stock >= $n RETURNING`,
 // not `SELECT ... FOR UPDATE` + a JS-side check. Both are race-free (both
@@ -17,7 +18,7 @@ import { Product } from './entities/product.entity';
 import { Order, OrderStatus } from './entities/order.entity';
 import { OrderItem } from './entities/order-item.entity';
 import { Task } from './entities/task.entity';
-import { OrderPlacedData } from './events/publisher';
+import { toOrderPlacedEvent } from './outbox/order-placed.event';
 
 export class InsufficientStockError extends Error {
   constructor(public readonly productId: string) {
@@ -33,33 +34,78 @@ export class InsufficientBalanceError extends Error {
   }
 }
 
+/** The same Idempotency-Key reused for a different order — one key is one
+ *  intent, it can't mean two different purchases. */
+export class IdempotencyKeyReuseError extends Error {
+  constructor(public readonly key: string) {
+    super(`Idempotency-Key "${key}" was already used for a different checkout request`);
+    this.name = 'IdempotencyKeyReuseError';
+  }
+}
+
 export interface CheckoutResult {
   orderId: string;
   totalCents: number;
+  /** true when this call didn't place anything — the key had already
+   *  produced this order, and this is that order handed back again. */
+  replayed: boolean;
+}
+
+export interface CheckoutOptions {
+  /** HW #22 level 3: the client's Idempotency-Key. Two calls with the same
+   *  key place ONE order — the key identifies the intent, not the body
+   *  (two legitimately identical orders just use two keys). */
+  idempotencyKey?: string;
+  /** demo:crash-write only — runs inside the transaction right after the
+   *  outbox row is inserted; throwing here is the "business write fails
+   *  after the event was already written" case. */
+  afterOutboxInsert?: (manager: EntityManager) => Promise<void>;
 }
 
 /**
- * HW #19: the `order.placed` event's actual origin — requirement #1 reads
- * "the event comes from your critical business operation", not from a
- * controller or a demo script reaching into the broker on its own.
- * `publish` is optional and deliberately called AFTER `ds.transaction(...)`
- * resolves, never from inside it: publishing INSIDE the transaction would
- * tell the world "order placed" before Postgres has actually committed
- * (and a rollback after that point could never be taken back) — the
- * classic dual-write problem between two different systems with no
- * shared transaction. This HW doesn't claim to solve that atomically
- * (publish failing here after a successful commit is a real, open gap) —
- * that's a transactional outbox, HW #22's job, named here rather than
- * quietly papered over.
+ * HW #19 published `order.placed` right after this transaction committed —
+ * a dual write with no shared COMMIT, where a crash between the two lost
+ * the event for good. HW #22 closes that gap with a transactional outbox:
+ * the event is just another row INSERTed in this same transaction, so it
+ * exists if and only if the order does. Nothing here talks to the broker
+ * (a broker can't roll back) — src/outbox/relay.ts moves committed rows
+ * out afterwards, at-least-once.
  */
 export async function checkout(
   ds: DataSource,
   userId: string,
   productId: string,
   quantity: number,
-  publish?: (data: OrderPlacedData) => Promise<unknown>,
+  opts: CheckoutOptions = {},
 ): Promise<CheckoutResult> {
-  const result = await ds.transaction(async (manager: EntityManager) => {
+  return ds.transaction(async (manager: EntityManager) => {
+    // Claim the key FIRST, before touching stock: a concurrent request with
+    // the same key blocks right here on the unique index until this
+    // transaction ends — then either sees our committed row (replay) or,
+    // if we rolled back, claims the key itself. No SELECT-then-INSERT
+    // window in between.
+    // Keys are scoped per buyer: the same key from two different buyers is
+    // two different intents.
+    const request = { productId, quantity };
+    if (opts.idempotencyKey !== undefined) {
+      const claimed: Array<{ key: string }> = await manager.query(
+        `INSERT INTO idempotency_keys (user_id, key, request) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id, key) DO NOTHING RETURNING key`,
+        [userId, opts.idempotencyKey, request],
+      );
+      if (claimed.length === 0) {
+        const [existing]: Array<{ request: typeof request; order_id: string; total_cents: number }> =
+          await manager.query(
+            `SELECT request, order_id, total_cents FROM idempotency_keys WHERE user_id = $1 AND key = $2`,
+            [userId, opts.idempotencyKey],
+          );
+        if (existing.request.productId !== productId || existing.request.quantity !== quantity) {
+          throw new IdempotencyKeyReuseError(opts.idempotencyKey);
+        }
+        return { orderId: String(existing.order_id), totalCents: existing.total_cents, replayed: true };
+      }
+    }
+
     // Lock + check + write, one statement, zero window: 0 rows back means
     // "not enough stock", full stop — no other transaction can observe or
     // act on a half-decided state in between.
@@ -121,17 +167,31 @@ export async function checkout(
       }),
     );
 
-    return { orderId: order.id, totalCents };
+    // The event, as a row: same transaction, same COMMIT as the order.
+    // Payload is the explicit contract from toOrderPlacedEvent(), never
+    // the `order` entity spread as-is.
+    const event = toOrderPlacedEvent({
+      id: order.id,
+      userId,
+      productId,
+      quantity,
+      totalCents,
+      createdAt: order.createdAt,
+    });
+    await manager.query(
+      `INSERT INTO outbox (aggregate_type, aggregate_id, type, payload) VALUES ('order', $1, $2, $3)`,
+      [order.id, event.type, event],
+    );
+
+    await opts.afterOutboxInsert?.(manager);
+
+    if (opts.idempotencyKey !== undefined) {
+      await manager.query(
+        `UPDATE idempotency_keys SET order_id = $3, total_cents = $4 WHERE user_id = $1 AND key = $2`,
+        [userId, opts.idempotencyKey, order.id, totalCents],
+      );
+    }
+
+    return { orderId: order.id, totalCents, replayed: false };
   });
-
-  // Best-effort, outside the transaction, AFTER it has committed — see
-  // this function's own header comment for why. A failure here throws
-  // past the caller with the order already placed, not rolled back; this
-  // HW names that gap rather than hiding it (README's "Async events"
-  // section).
-  if (publish) {
-    await publish({ orderId: result.orderId, userId, totalCents: result.totalCents, productId, quantity });
-  }
-
-  return result;
 }

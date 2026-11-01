@@ -70,9 +70,10 @@ export PACT_BROKER_TOKEN
 PACT_BROKER_TOKEN="$([ -f "$ROOT/secrets/pact_broker_token" ] && cat "$ROOT/secrets/pact_broker_token" || echo '')"
 
 # HW #19: RabbitMQ address, same vault, right next to the DB connection —
-# same file-based convention again. app.js reads BROKER_URL too (POST
-# /checkout, see env.schema.js), so it's ALSO in .env.example — a file in
-# secrets/ wins over .env here, same precedence as DB_PASSWORD. Default matches
+# same file-based convention again, not .env (app.js itself never talks to
+# the broker — since HW #22 only the outbox relay and the consumers do, and
+# they all run through this wrapper). An already-exported BROKER_URL is
+# kept when there's no secrets/broker_url file. Default matches
 # docker-compose.yml's rabbitmq service (app/app, AMQP port 5672) — not a
 # secret, same allowance as HW #16's local Pact Broker URL.
 export BROKER_URL
