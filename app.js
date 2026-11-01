@@ -12,6 +12,11 @@ const { validate } = require('./src/config/env.schema');
 const { OrderEventsService } = require('./dist/realtime/order-events.service');
 const { attachOrdersGateway } = require('./dist/realtime/orders.gateway');
 const { createOrderEventsSseHandler } = require('./dist/realtime/orders.controller');
+const amqp = require('amqplib');
+const { DataSource } = require('typeorm');
+const AppDataSource = require('./dist/data-source').default;
+const { CheckoutService } = require('./dist/checkout.service');
+const { InsufficientStockError, InsufficientBalanceError } = require('./dist/checkout');
 
 // Fail-fast: either the process starts with a fully valid config, or it
 // doesn't start at all — and says in plain language which variable is
@@ -71,6 +76,31 @@ const idempotencyStore = new Map(); // Idempotency-Key -> { bodyHash, status, re
 // of wiring — subscribe to the exact same instance, not two independent
 // copies that could drift.
 const orderEvents = new OrderEventsService();
+
+// HW #19: the one HTTP path into the real, Postgres-backed checkout()
+// (HW #14) — and through CheckoutService, the one place that always passes
+// checkout() its `publish` callback, so every order placed here emits
+// order.placed. Same DB as `pool` above (DB_URL + the rotating password
+// file, not with-secrets.sh's DB_HOST/… split, which `npm start` never
+// runs through) — AppDataSource's entities/logger, this process's own
+// connection. Lazy: nothing connects until the first POST /checkout, so
+// app.e2e.test.js and the Pact provider keep needing only what they did.
+const checkoutService = new CheckoutService(
+  new DataSource({
+    ...AppDataSource.options,
+    host: dbUrl.hostname,
+    port: dbUrl.port ? Number(dbUrl.port) : 5432,
+    database: dbUrl.pathname.slice(1),
+    username: decodeURIComponent(dbUrl.username),
+    password: async () => (await readFile(PASSWORD_FILE, 'utf8')).trim(),
+    // AppDataSource's max: 30 is sized for demo:race's 60 concurrent
+    // checkouts; an HTTP process needs the same order of magnitude as
+    // `pool` above, not 30 extra PgBouncer clients on top of it.
+    extra: { max: 5 },
+  }),
+  () => amqp.connect(env.BROKER_URL),
+  log,
+);
 
 function getOwnedOrder(orderId) {
   const order = orders.get(orderId);
@@ -293,6 +323,19 @@ function createApp() {
 
       res.status(201).json(toPublicOrder(order));
     } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/checkout', async (req, res, next) => {
+    try {
+      const { user_id, product_id, quantity } = req.body;
+      const result = await checkoutService.placeOrder(user_id, product_id, quantity);
+      res.status(201).json({ order_id: result.orderId, total_cents: result.totalCents });
+    } catch (err) {
+      if (err instanceof InsufficientStockError || err instanceof InsufficientBalanceError) {
+        return next(new ProblemError(409, err.message));
+      }
       next(err);
     }
   });

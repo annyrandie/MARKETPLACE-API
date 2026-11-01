@@ -50,11 +50,10 @@ export function runConsumer(channel: Channel, pool: Pool, opts: ConsumeOptions):
     let consumerTag: string | undefined;
     const finish = (err?: unknown) => {
       if (settled) {
-        // A message that slips in after `stopAfter` was already reached
-        // (queue backlog, a race on the last delivery) would otherwise be
-        // silently dropped here — neither acked, nacked, nor logged, and
-        // left stuck on the channel until it closes. Not expected in any
-        // of the demos, but a swallowed error is worse than a noisy one.
+        // Messages past `stopAfter` never get here — handleMessage()'s own
+        // guard nacks them back to the queue before any work. What can
+        // still arrive is an error from a delivery that was already in
+        // flight when we settled; a swallowed error is worse than a noisy one.
         if (err) console.error('[runConsumer] late error after stopAfter:', err);
         return;
       }
@@ -85,7 +84,24 @@ export function runConsumer(channel: Channel, pool: Pool, opts: ConsumeOptions):
       })
       .catch(finish);
 
+    // Counted synchronously, BEFORE any await — with prefetch > 1 the broker
+    // can hand over several messages while the first is still inside
+    // logDelivery()/applyEffectOnce(), so `summary.delivered` (bumped only
+    // after an await) would let all of them through the guard below.
+    let claimed = 0;
+
     async function handleMessage(msg: ConsumeMessage): Promise<void> {
+      // Guard FIRST, before logDelivery(): a message beyond `stopAfter`
+      // (queue backlog, prefetch buffer) is not this run's delivery — it
+      // must neither be counted in order_event_deliveries nor left
+      // unacked on the channel. nack(requeue=true) hands it straight back
+      // to the queue for the next consumer, untouched.
+      if (settled || (opts.stopAfter && claimed >= opts.stopAfter)) {
+        channel.nack(msg, false, true);
+        return;
+      }
+      claimed += 1;
+
       const event: OrderPlacedEvent = JSON.parse(msg.content.toString('utf8'));
       // eslint-disable-next-line no-console
       console.error(`DELIVERED ${event.eventId}`);

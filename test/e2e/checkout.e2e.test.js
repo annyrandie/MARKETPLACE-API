@@ -79,12 +79,12 @@ describe('E2E (data layer): the real checkout() against a real Postgres', () => 
   });
 
   // HW #19: checkout() takes an optional `publish` callback, called AFTER
-  // the transaction commits — this is this project's one real caller that
-  // actually exercises that wiring end to end. Every HW #19 demo script
-  // calls publishOrderPlaced() directly against a hand-built event
-  // instead, so without this test nothing in the repo would ever catch a
-  // typo in checkout.ts's own field mapping (orderId/userId/totalCents/…)
-  // or a publish that fired before the row was actually committed.
+  // the transaction commits. The production caller is CheckoutService
+  // (behind app.js's POST /checkout), which binds it to RabbitMQ — this
+  // test pins checkout()'s own half of that contract with no broker in
+  // the way: the field mapping (orderId/userId/totalCents/…) and that the
+  // callback only fires once the row is actually committed. The HW #19
+  // demo scripts publish hand-built events and never cover either.
   test('calls the optional publish callback once, after commit, with the real order data', async () => {
     const userId = await insertUser(100000);
     const productId = await insertProduct(5, 2000);

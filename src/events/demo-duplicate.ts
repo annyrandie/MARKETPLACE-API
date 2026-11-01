@@ -81,6 +81,7 @@ async function main(): Promise<void> {
 
   console.log(`deliveries=${deliveries}`);
   console.log(`effect=${effect}`);
+  console.log(`skipped=${deliveries - effect}`);
 
   await pool.end();
 

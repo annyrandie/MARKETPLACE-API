@@ -34,6 +34,7 @@ async function main(): Promise<void> {
 
   // Only reached on the non-crashing path — `process.kill(pid, 'SIGKILL')`
   // inside runConsumer() never returns control here.
+  await channel.close();
   await connection.close();
   await pool.end();
   process.exit(0);

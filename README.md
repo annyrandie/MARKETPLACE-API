@@ -1132,6 +1132,17 @@ never be taken back. This HW doesn't claim to close that gap atomically
 that's a transactional outbox, named here as HW #22's job, not quietly
 assumed away.
 
+The callback is wired in exactly one place — `src/checkout.service.ts`
+(`CheckoutService.placeOrder()`), which always passes it, bound to a
+long-lived `ConfirmChannel` → `publishOrderPlaced()`. app.js exposes that
+service as **`POST /checkout`** (`{user_id, product_id, quantity}` → `201
+{order_id, total_cents}`, `409` on insufficient stock/balance), so every
+order placed over HTTP actually emits `order.placed`. DB and broker are
+opened lazily on the first request (app.e2e/Pact don't need RabbitMQ). A
+publish failure after commit is logged, not turned into a 500: the order
+is already in Postgres, and a 500 would only invite a retry that places a
+second one.
+
 ### Consumer: manual ack, after the effect, prefetch justified
 
 `src/events/consumer.ts`: `noAck: false`, and `channel.ack()` happens
@@ -1193,6 +1204,7 @@ npm run demo:dlq
 npm run demo:duplicate
 # deliveries=2
 # effect=1
+# skipped=1
 ```
 
 `demo:duplicate`'s redelivery is a **real `kill -9`** on a **separate

@@ -6,7 +6,7 @@ info:
   description: >
     Marketplace API contract — the source of truth for the DB schema (HW #12),
     entities (HW #13), the transactional order-checkout logic (HW #14), and
-    the contract/E2E suite (HW #16). Six honest operations that are actually
+    the contract/E2E suite (HW #16). Seven honest operations that are actually
     implemented in variant B (`app.js`), not declared just in case.
 
 servers:
@@ -252,6 +252,39 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /checkout:
+    post:
+      operationId: checkout
+      tags: [orders]
+      summary: >
+        The real, Postgres-backed transactional checkout (HW #14) — unlike
+        `POST /orders` above, which is HW #9's in-memory variant B. Stock
+        and the buyer's balance are decremented atomically in one
+        transaction; after it commits, an `order.placed` event is published
+        to RabbitMQ (HW #19). A failed publish does NOT fail this request —
+        the order is already committed (see README, "Async events").
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckoutRequest'
+      responses:
+        '201':
+          description: Order committed; order.placed published (best-effort, after commit)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Not enough stock, or not enough balance — nothing was committed
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
 components:
   parameters:
     Limit:
@@ -316,6 +349,33 @@ components:
             $ref: '#/components/schemas/Problem'
 
   schemas:
+    CheckoutRequest:
+      type: object
+      additionalProperties: false
+      required: [user_id, product_id, quantity]
+      properties:
+        user_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: users.id (bigint, as a string)
+        product_id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: products.id (bigint, as a string)
+        quantity:
+          type: integer
+          minimum: 1
+
+    CheckoutResult:
+      type: object
+      additionalProperties: false
+      required: [order_id, total_cents]
+      properties:
+        order_id:
+          type: string
+        total_cents:
+          type: integer
+
     Problem:
       type: object
       description: RFC 7807 problem+json — the single error contract of this API.
