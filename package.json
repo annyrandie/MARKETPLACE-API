@@ -1,7 +1,7 @@
 {
   "name": "marketplace-api",
   "version": "1.0.0",
-  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16) + realtime WebSocket/SSE (HW #18) + async events over RabbitMQ (HW #19)",
+  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16) + realtime WebSocket/SSE (HW #18) + async events over RabbitMQ (HW #19) + transactional outbox, relay, idempotent consumer (HW #22)",
   "main": "app.js",
   "scripts": {
     "start": "npm run build --silent && node app.js",
@@ -33,7 +33,12 @@
     "test": "echo \"no automated tests for variant B — see README, Verification section\" && exit 0",
     "demo:publish": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/events/demo-publish.js",
     "demo:dlq": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/events/demo-dlq.js",
-    "demo:duplicate": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/events/demo-duplicate.js"
+    "demo:duplicate": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/events/demo-duplicate.js",
+    "demo:outbox": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/demo-outbox.js",
+    "demo:crash-write": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/demo-crash-write.js",
+    "demo:crash-relay": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/demo-crash-relay.js",
+    "outbox:relay": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/relay-worker.js",
+    "outbox:consumer": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/invoicing-worker.js"
   },
   "keywords": [],
   "author": "",

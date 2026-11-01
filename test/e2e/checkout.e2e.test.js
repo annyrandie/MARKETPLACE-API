@@ -78,38 +78,73 @@ describe('E2E (data layer): the real checkout() against a real Postgres', () => 
     expect(orderRows[0].total_amount_cents).toBe(4000);
   });
 
-  // HW #19: checkout() takes an optional `publish` callback, called AFTER
-  // the transaction commits. The production caller is CheckoutService
-  // (behind app.js's POST /checkout), which binds it to RabbitMQ — this
-  // test pins checkout()'s own half of that contract with no broker in
-  // the way: the field mapping (orderId/userId/totalCents/…) and that the
-  // callback only fires once the row is actually committed. The HW #19
-  // demo scripts publish hand-built events and never cover either.
-  test('calls the optional publish callback once, after commit, with the real order data', async () => {
+  // HW #22: the event is an outbox row in checkout()'s OWN transaction —
+  // this pins checkout()'s half of the outbox contract with no broker in
+  // the way: the payload is the designed event (not the entity), and it
+  // lives or dies with the order.
+  test('writes order.placed to the outbox in the same transaction, with the designed contract', async () => {
     const userId = await insertUser(100000);
     const productId = await insertProduct(5, 2000);
 
-    const publishedEvents = [];
-    const publish = async (data) => {
-      // If this ran before commit, the row wouldn't be visible yet on
-      // this SEPARATE connection (pg.pool, not the transaction's own) —
-      // reading it back here is what actually proves "after", not just
-      // "awaited the same promise chain".
-      const { rows } = await pg.pool.query('SELECT total_amount_cents FROM orders WHERE id = $1', [data.orderId]);
-      publishedEvents.push({ data, orderVisibleAfterCommit: rows.length === 1 });
-    };
+    const result = await checkoutModule.checkout(AppDataSource, userId, productId, 3);
 
-    const result = await checkoutModule.checkout(AppDataSource, userId, productId, 3, publish);
-
-    expect(publishedEvents).toHaveLength(1);
-    expect(publishedEvents[0].orderVisibleAfterCommit).toBe(true);
-    expect(publishedEvents[0].data).toMatchObject({
-      orderId: result.orderId,
-      userId,
-      productId,
-      quantity: 3,
-      totalCents: result.totalCents,
+    const { rows } = await pg.pool.query(
+      `SELECT aggregate_type, aggregate_id, type, payload, published_at FROM outbox WHERE aggregate_id = $1`,
+      [result.orderId],
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ aggregate_type: 'order', type: 'order.placed', published_at: null });
+    expect(rows[0].payload).toMatchObject({
+      eventId: `order.placed:${result.orderId}`,
+      type: 'order.placed',
+      data: { orderId: result.orderId, userId, productId, quantity: 3, totalCents: result.totalCents },
     });
+  });
+
+  test('a failure after the outbox insert rolls the event back together with the order', async () => {
+    const userId = await insertUser(100000);
+    const productId = await insertProduct(5, 2000);
+
+    await expect(
+      checkoutModule.checkout(AppDataSource, userId, productId, 1, {
+        afterOutboxInsert: async () => {
+          throw new Error('boom');
+        },
+      }),
+    ).rejects.toThrow('boom');
+
+    const { rows: outboxRows } = await pg.pool.query(`SELECT 1 FROM outbox WHERE payload->'data'->>'userId' = $1`, [
+      userId,
+    ]);
+    const { rows: orderRows } = await pg.pool.query('SELECT 1 FROM orders WHERE user_id = $1', [userId]);
+    expect(outboxRows).toHaveLength(0);
+    expect(orderRows).toHaveLength(0);
+  });
+
+  test('two concurrent checkouts with the same Idempotency-Key place one order', async () => {
+    const userId = await insertUser(100000);
+    const productId = await insertProduct(5, 2000);
+    const key = `e2e-key-${Date.now()}`;
+
+    const [a, b] = await Promise.all([
+      checkoutModule.checkout(AppDataSource, userId, productId, 2, { idempotencyKey: key }),
+      checkoutModule.checkout(AppDataSource, userId, productId, 2, { idempotencyKey: key }),
+    ]);
+
+    expect(a.orderId).toBe(b.orderId);
+    expect([a.replayed, b.replayed].sort()).toEqual([false, true]);
+    const { rows } = await pg.pool.query('SELECT stock FROM products WHERE id = $1', [productId]);
+    expect(rows[0].stock).toBe(3); // decremented once, not twice
+
+    await expect(
+      checkoutModule.checkout(AppDataSource, userId, productId, 1, { idempotencyKey: key }),
+    ).rejects.toThrow(checkoutModule.IdempotencyKeyReuseError);
+
+    // Keys are per buyer: someone else picking the same key is a different intent.
+    const otherUserId = await insertUser(100000);
+    const other = await checkoutModule.checkout(AppDataSource, otherUserId, productId, 2, { idempotencyKey: key });
+    expect(other.replayed).toBe(false);
+    expect(other.orderId).not.toBe(a.orderId);
   });
 
   test('negative case: insufficient stock rejects, and nothing partially commits', async () => {
