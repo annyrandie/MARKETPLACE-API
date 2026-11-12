@@ -37,7 +37,13 @@ transaction), a `FOR UPDATE SKIP LOCKED` relay, an inbox-deduplicated
 consumer, and a server-side Idempotency-Key — with both sides of a
 "failed write" proven by demos, one of them a real `kill -9` between
 publish and `UPDATE published_at`. See
-[Outbox](#outbox-та-ідемпотентність-hw-22) below.
+[Outbox](#outbox-та-ідемпотентність-hw-22) below. HW #23 adds Redis
+on top — on **two** instances, because a cache and a queue need opposite
+eviction policies: cache-aside with jittered TTLs and a single-flight
+lock (25 concurrent misses → 1 DB query), sessions with a rolling TTL, a
+rate limit shared by two pods, and a BullMQ queue with retries, jobId
+dedup and a job scheduler. See
+[Redis](#redis-кеш-сесії-ліміти-черга-hw-23) below.
 
 ## Quickstart for the grader
 
@@ -132,6 +138,15 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `src/outbox/invoicing.consumer.ts` | idempotent consumer: inbox mark + natural-key effect in ONE transaction, ack after COMMIT |
 | `src/outbox/invoicing-worker.ts` | the consumer as a long-running process (`npm run outbox:consumer`) |
 | `src/outbox/demo-outbox.ts` / `demo-crash-write.ts` / `demo-crash-relay.ts` / `demo-kit.ts` | `npm run demo:outbox` / `demo:crash-write` / `demo:crash-relay` + their shared cleanup/counting |
+| `docker-compose.yml` → `redis-cache` / `redis-queue` | HW #23: two Redis boxes — `allkeys-lru` + `maxmemory 64mb` vs `noeviction` + AOF `everysec` |
+| `src/redis/connections.ts` | `createCacheRedis()` / `createStateRedis()` / `createWorkerRedis()` (`maxRetriesPerRequest: null`) + runtime `CONFIG GET` |
+| `src/redis/cache.ts` | `CacheAside` — jittered TTL, `SET NX PX` single-flight lock, Lua compare-and-delete release, every Redis error degrades to the DB |
+| `src/repositories/product-card.repository.ts` | the heavy read (product + sales aggregates) + `CountingQueryable`, which counts statements actually sent to Postgres |
+| `src/redis/session.ts` | Redis session store (`GETEX … EX` rolling TTL, hashed token, absolute cap) + express middleware |
+| `src/redis/rate-limit.ts` | sliding-window limiter as one Lua script on Redis `TIME`, 429 + `Retry-After` |
+| `src/redis/order-email.queue.ts` | BullMQ `order-email` queue: attempts/backoff/jitter, jobId from the event id, `upsertJobScheduler` |
+| `src/redis/queue-worker.ts` | the worker as its own process (`npm run queue:worker`); refuses to start on a non-`noeviction` box |
+| `src/redis/demo-cache.ts` / `demo-session.ts` / `demo-ratelimit.ts` / `demo-queue.ts` | `npm run demo:cache` / `demo:session` / `demo:ratelimit` / `demo:queue` |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -345,9 +360,12 @@ artifact.
 
 ```bash
 docker compose up -d --wait
+npm ci
 npm run build
 
 export DB_HOST=127.0.0.1 DB_PORT=6432 DB_USER=admin DB_PASSWORD=admin-bootstrap-only DB_NAME=marketplace
+export REDIS_URL=redis://127.0.0.1:6379         # HW #23: redis-cache (allkeys-lru)
+export REDIS_QUEUE_URL=redis://127.0.0.1:6380   # HW #23: redis-queue (noeviction) — queue, sessions, rate limits
 export SKIP_VAULT=1    # у грейдера немає доступу до сховища
 
 npm run migrate
@@ -400,6 +418,15 @@ npm run demo:duplicate
 npm run demo:outbox
 npm run demo:crash-write
 npm run demo:crash-relay
+
+# HW #23 — Redis (both boxes come up with the same `docker compose up -d
+# --wait`; REDIS_URL / REDIS_QUEUE_URL exported above; DB_* as above —
+# demo:cache reads Postgres, the other three only Redis)
+npx tsc --noEmit
+npm run demo:cache
+npm run demo:session
+npm run demo:ratelimit
+npm run demo:queue
 ```
 
 (Port `6432`, not `5433` — every one of the commands above (`migrate`
@@ -1429,6 +1456,246 @@ consumer's dedup key — not something the broker provides. The same holds
 for Kafka's exactly-once semantics: they hold *inside* Kafka
 (read-process-write between its own topics); the moment the other end is
 your database, the guarantee comes back down to your own dedup key.
+
+## Redis: кеш, сесії, ліміти, черга (HW #23)
+
+Redis here makes the system **fast, not correct**. Everything correctness
+depends on stays where HW #14/#22 put it: the oversell guard is
+checkout's atomic `UPDATE … WHERE stock >= $n`, the "event exists iff the
+order exists" guarantee is the outbox, and dedup of side effects is a
+unique key in Postgres. Redis sits in front of that as a cache, a session
+store, a rate-limit counter and a job queue, and any of these can fail
+without corrupting state.
+
+### Why there are two Redis instances
+
+**A cache needs `maxmemory` + `allkeys-lru` (it must be allowed to
+forget). BullMQ needs `noeviction` (it "cannot work properly if Redis
+evicts keys arbitrarily"). Both are per-process settings, and `SELECT 1`
+doesn't split them, so they have to be two containers.**
+
+| | `redis-cache` (`REDIS_URL`, :6379) | `redis-queue` (`REDIS_QUEUE_URL`, :6380) |
+|---|---|---|
+| `maxmemory` | `64mb` | `256mb` |
+| `maxmemory-policy` | `allkeys-lru` | `noeviction` |
+| persistence | none (a restarted cache is just cold) | AOF, `appendfsync everysec` (lose at most ~1 s) |
+| holds | product cards, single-flight locks | BullMQ jobs, **sessions**, **rate-limit counters** |
+
+Sessions live on the **queue box** rather than a third instance. They need
+the same thing the queue needs: never evicted, and surviving a restart. On
+the LRU box a session would eventually be evicted under memory pressure,
+and the user would be logged out in a way nobody can reproduce. Rate-limit
+counters sit there for the same reason, since an evicted counter is a
+limit that silently resets. A third instance would only pay off once
+sessions need their own memory budget or their own failover. The ports
+are outside the lecture range (22300–22399), and both are bound to
+`127.0.0.1` only, because these dev boxes have no auth.
+
+The demos check this at runtime, not just from the config file. They run
+`CONFIG GET` on their own connection (`cache-lru=1` and
+`queue-noeviction=1`). `npm run queue:worker` also refuses to start if
+`REDIS_QUEUE_URL` points at a box that isn't `noeviction`.
+
+### 1. Cache-aside on the product card
+
+The heavy read is `ProductCardRepository.findCard()`: product plus live
+stock, `SUM(quantity)` and `COUNT(DISTINCT order_id)` over `order_items`.
+It's a join and a `GROUP BY` that grow with order history, while the
+answer changes rarely. On a miss the code reads Postgres and writes
+`product-card:v1:<id>`. On a hit only Redis is touched. Details:
+
+- **TTL is always set**: `300 + randomInt(0..60)` s, a 60 s spread.
+  Without jitter, the 60 keys warmed by one loop expire in the same second
+  and cause a stampede of their own. `invalidate()` exists for writes, as
+  an addition to the TTL, never a replacement for it.
+- **Redis is never on the failure path.** A failed `GET` counts as a miss,
+  a failed `SET` (e.g. `OOM command not allowed` on a misconfigured box)
+  is logged and the user still gets the answer, and if the lock can't be
+  taken the request just loads. A cache that fails requests isn't a cache.
+- Values are wrapped in `{"v": …}`, so a cached "not found" (`null`) is a
+  hit and not a miss forever.
+
+### 2. Single-flight lock against a stampede
+
+On a miss:
+
+1. The request runs `SET lock:<key> <uuid> NX PX 3000`, and exactly one
+   caller wins.
+2. The winner re-reads the cache, because the previous holder may have
+   just filled it.
+3. The winner loads from Postgres and writes the value with its jittered
+   TTL.
+4. The winner releases the lock with a compare-and-delete in Lua:
+   `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`.
+
+The losers poll the cache every 25 ms. If the lock disappears without a
+value (the winner died), one of the losers takes it over. A bare `DEL`
+would be wrong: if our lock expired while we were loading, someone else
+now holds it, and `DEL` would release *their* lock. Lua is used rather than
+`DELEX … IFEQ`, so the code doesn't silently depend on Redis 8.4+.
+
+`db-calls` is counted **per SQL statement sent to Postgres**, by the
+`CountingQueryable` wrapper around the pool, not per call of `findCard()`.
+If the loader ever grew a second query, the count would show it.
+
+```bash
+npm run demo:cache
+# cache-lru=1
+# cache-maxmemory=1            # 67108864 bytes
+# warmed=60
+# ttl-distinct=39              # TTL range 300..358 s; varies per run, always well above 5
+# concurrent=25                # through 5 separate Redis connections ("pods")
+# pods=5
+# db-calls=1
+# db-calls-warm=0              # 100 more reads of the warm cache
+# results-consistent=1         # all 25 got the identical card
+
+node dist/redis/demo-cache.js --no-lock   # control run: same stampede, no single-flight
+# db-calls=25
+# ✗ invariant violated: stampede -> exactly one DB call
+```
+
+### What happens if the stampede lock breaks, and why that's fine here
+
+A Redis lock can break in two ways. The winner can pause longer than
+`PX 3000` (GC, page fault, container move), so the lock expires and a
+second caller takes it while the first one is still loading. Or Redis can
+fail over to a replica that never saw the `SET NX`. Either way, two
+callers believe they hold the lock. **Here the consequence is one extra
+`SELECT` and two identical `SET`s of the same value.** Nothing gets
+corrupted: the cached card is derived data with a TTL, and the next write
+overwrites it with an equally valid copy. That's why a single Redis plus
+`SET NX PX` is enough, and why there's no Redlock and no fencing token.
+The lock is an **optimisation**: when it fails, the cost is an extra
+read. The same lock would be **wrong** as a guard for a business invariant
+(stock, balance, "one invoice per order"). A paused holder wakes up still
+convinced the lock is its own, and checking "is it still mine?" before
+writing doesn't help, because the pause can happen between the check and
+the write. Those invariants are guarded by a transaction and atomic
+`UPDATE` (HW #14), a unique key (`ON CONFLICT`, HW #19/#22), or a fencing
+token that the store itself checks. A distributed lock doesn't replace
+idempotency. It only holds inside its validity window and only while the
+process doesn't stall. Idempotency survives both a worker restart and a
+redelivery.
+
+### 3. Sessions with a rolling TTL
+
+This is custom token state, not `express-session`. `connect-redis@10` is
+ESM-only and needs Node ≥ 22, while this build is CJS on Node 20.
+
+- **Login** writes `sess:<sha256(token)>` with `EX 1800`. The cookie
+  holds 32 random bytes, `HttpOnly`, `SameSite=Lax`. Redis stores only the
+  hash, so a leaked AOF or a `SCAN sess:*` yields no usable tokens.
+- **Every request** runs `GETEX key EX 1800`, which reads and renews the
+  TTL in **one** command. An active user's session doesn't run out
+  mid-work, and there is no race between a read and a separate `EXPIRE`.
+- An **absolute cap** of 12 h from login. A rolling TTL alone would let
+  a session that's used once every 29 minutes live forever.
+- The state is in Redis, not in process memory. The demo stops the app
+  **and** closes its Redis connection, boots a fresh one, and the same
+  cookie still works.
+
+```bash
+npm run demo:session
+# requests=6                   # login, /me, /me (with real 1.5 s waits), restart, /me, logout, /me → 401
+# sessions=1
+# in-redis=1
+# ttl-renewed=1                # PTTL 1798491 ms before the request → 1799995 ms after
+# survived-restart=1
+# logout-deleted=1
+```
+
+### 4. A rate limit shared by pods
+
+The counter lives on the queue box, so every pod sees the same one. An
+in-memory counter would let through `limit × pods`.
+
+**Model: sliding window (log in a ZSET). We deliberately don't allow a
+burst.** It guards against one client hammering an endpoint. A fixed
+window lets 2× the limit through around the boundary (5 requests at
+12:00:59 plus 5 at 12:01:00), and a token bucket would allow a full bucket
+at once.
+
+- The whole check is **one Lua script**: `ZREMRANGEBYSCORE`, then
+  `ZCARD`, then `ZADD` + `PEXPIRE`. As three separate commands, two pods
+  could both see `count = limit-1` and both get through, so the limit
+  would leak exactly under the load it exists for. Here atomicity is a
+  correctness requirement, unlike the cache lock.
+- "Now" comes from Redis's own `TIME` inside the script, not from the
+  pods' clocks, which drift.
+- Over the limit, the response is `429` problem+json with
+  `Retry-After: <s until the oldest hit leaves the window>`, plus
+  `RateLimit-Limit` / `RateLimit-Remaining`.
+- **Fail-open.** If Redis is unreachable, the request goes through and the
+  error is logged. This limiter protects capacity and is not a security
+  boundary, so Redis being down shouldn't take the API down too.
+
+```bash
+npm run demo:ratelimit
+# instances=2                  # two HTTP servers, each with its OWN Redis connection + limiter
+# limit=5
+# requests=12                  # alternating pod-0, pod-1, …
+# allowed=5                    # 3 + 2 — both pods served, the sum is still 5, not 10
+# blocked=7
+# status=429
+# retry-after=1                # Retry-After: 10
+# pods-served=2
+# burst-allowed=5              # same 12 fired all at once: still 5, so the Lua script really is atomic
+```
+
+### 5. A BullMQ queue: retries, jobId dedup, a scheduler
+
+The `order-email` queue carries the order confirmation for HW #22's
+`order.placed`, the kind of work that has no business inside the HTTP
+request.
+
+- `attempts: 4`, `backoff: { type: 'exponential', delay: 500, jitter: 0.5 }`,
+  so retries come after roughly 0.5 s, 1 s and 2 s, each ±50%. Jitter
+  stops a batch that failed together from retrying together.
+- **`jobId` comes from the event's own `eventId`**
+  (`confirm-order.placed-<orderId>`; BullMQ forbids `:` in custom ids).
+  The relay is at-least-once by design, so the same event will sometimes
+  be enqueued twice, and two `add()`s with one jobId give one job.
+  `removeOnComplete` is `{ age: 24h, count: 10000 }` and **not `true`**,
+  because a removed job no longer counts as a duplicate and dedup would
+  silently stop working.
+- The scheduler uses **`upsertJobScheduler`**. The repeatable API is gone
+  in BullMQ 6, and `add` would stack one scheduler per restart.
+  `queue:worker` upserts it on every boot.
+- Workers use a `maxRetriesPerRequest: null` connection, so they wait
+  for Redis through a disconnect instead of crashing. Request-path
+  connections (`Queue.add`, sessions, limits) keep failing fast.
+
+```bash
+npm run demo:queue
+# queue-noeviction=1
+# added=2                      # the same event enqueued twice
+# same-job=1                   # both add()s returned confirm-order.placed-900001
+# queued=1
+# schedulers=1                 # upsertJobScheduler called twice ("two boots") → still one
+# attempts=3                   # SMTP 503, SMTP 503, success
+# completed=1
+# scheduled-runs=3             # every 500 ms, observed ~1.1 s
+```
+
+### Secrets, cleanup, what's not done
+
+- `REDIS_URL` and `REDIS_QUEUE_URL` come through `scripts/with-secrets.sh`,
+  the same vault as `DB_*` and `BROKER_URL`. The script reads
+  `secrets/redis_url` / `secrets/redis_queue_url` (gitignored), and falls
+  back to an already-exported value or the compose defaults. No new env
+  files were added. All four demo scripts start with
+  `bash scripts/with-secrets.sh dev …`, and `SKIP_VAULT=1` works as before.
+- **Every demo cleans up after itself.** `demo:cache` uses its own
+  fixture products and keys and deletes them. `demo:session` and
+  `demo:ratelimit` use per-run ids and delete them. `demo:queue` runs
+  under its own `bull-demo` key prefix and `obliterate`s it before and
+  after. After a full run, `DBSIZE` is 0 on both boxes.
+- The middlewares, the cache and the queue are **not wired into `app.js`
+  routes yet**. That would change HW #9's OpenAPI contract (new 401/429
+  responses, a card endpoint), so it's left as a separate step. The demos
+  run the real modules on throwaway express servers, the same way
+  `demo:outbox` runs the real checkout handler.
 
 ## Verification (acceptance criteria)
 
