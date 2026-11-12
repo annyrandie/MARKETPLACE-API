@@ -260,9 +260,27 @@ paths:
         The real, Postgres-backed transactional checkout (HW #14) — unlike
         `POST /orders` above, which is HW #9's in-memory variant B. Stock
         and the buyer's balance are decremented atomically in one
-        transaction; after it commits, an `order.placed` event is published
-        to RabbitMQ (HW #19). A failed publish does NOT fail this request —
-        the order is already committed (see README, "Async events").
+        transaction, and the `order.placed` event is written to the
+        transactional outbox in that SAME transaction (HW #22) — a relay
+        publishes it to RabbitMQ afterwards, at-least-once (see README,
+        "Outbox та ідемпотентність").
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+          description: >
+            One key = one purchase intent. Repeating the request with the
+            same key (a retry after a timeout, a double click) returns the
+            order the first request placed instead of placing a second one —
+            also when both requests arrive at the same time. The key, not the
+            body, is what identifies the intent: two genuinely identical
+            orders just use two keys. Keys are scoped per buyer (`user_id`)
+            — two buyers using the same key don't collide. Reusing a key for
+            a different request by the same buyer is rejected with 422.
       requestBody:
         required: true
         content:
@@ -271,7 +289,15 @@ paths:
               $ref: '#/components/schemas/CheckoutRequest'
       responses:
         '201':
-          description: Order committed; order.placed published (best-effort, after commit)
+          description: >
+            Order committed together with its order.placed outbox row. On a
+            repeat of the same Idempotency-Key, the same order again, with
+            `Idempotency-Replay: true`.
+          headers:
+            Idempotency-Replay:
+              description: 'true if this response replays an order an earlier request with this key already placed'
+              schema:
+                type: boolean
           content:
             application/json:
               schema:
@@ -280,6 +306,12 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           description: Not enough stock, or not enough balance — nothing was committed
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: This Idempotency-Key was already used for a different checkout request
           content:
             application/problem+json:
               schema:

@@ -18,11 +18,6 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
   TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
-
-  // HW #19: POST /checkout publishes order.placed here. Default is this
-  // repo's own docker-compose rabbitmq (app/app) — not a secret, same
-  // default scripts/with-secrets.sh falls back to.
-  BROKER_URL: z.url({ protocol: /^amqps?$/ }).default('amqp://app:app@127.0.0.1:5672'),
 });
 
 /** @param {Record<string, unknown>} raw
