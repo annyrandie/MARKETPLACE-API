@@ -44,7 +44,13 @@ lock (25 concurrent misses → 1 DB query), sessions with a rolling TTL, a
 rate limit shared by two pods, and a BullMQ queue with retries, jobId
 dedup and a job scheduler. The cache, the limiter and the sessions are
 wired into the app's own routes and OpenAPI contract. See
-[Redis](#redis-кеш-сесії-ліміти-черга-hw-23) below.
+[Redis](#redis-кеш-сесії-ліміти-черга-hw-23) below. HW #24 closes the
+API: ES256 access tokens with an explicit algorithm allowlist, opaque
+refresh tokens stored as peppered HMACs and rotated with reuse detection
+(a replayed token revokes the whole family), a logout that kills both
+tokens in one transaction, and 401 kept strictly apart from 403 — role
+guards for writes, ownership checked on the loaded resource. Keys come
+from the vault only. See [Auth](#auth) below.
 
 ## Quickstart for the grader
 
@@ -151,6 +157,15 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `src/redis/ratelimit-pod.ts` | one rate-limited "pod" as its own process — `demo:ratelimit` forks two |
 | `src/http/product-card.handler.ts` / `src/http/session.handlers.ts` | `GET /product-cards/{id}` (503 on `CacheBusyError`) / `POST /sessions`, `GET`/`DELETE /sessions/current` |
 | `test/e2e/redis.e2e.test.js` | the Redis routes in the real app, against real Postgres + two Redis containers |
+| `src/migrations/…-Auth.ts` | HW #24: `users.role` + `users.password_hash`, `refresh_tokens` (unique index on `token_hash`, index on `family_id`), `revoked_access_tokens` |
+| `src/auth/keys.ts` / `tokens.ts` | base64-PEM → KeyObject, keyring by `kid`, fingerprints; ES256 sign/verify with `algorithms: ['ES256']` |
+| `src/auth/auth.service.ts` | login, refresh rotation with reuse detection (one transaction), logout (family + jti in one transaction), per-request revocation check |
+| `src/auth/middleware.ts` | `requireAuth` (401) / `requireRole` (403) |
+| `src/auth/password.ts` | scrypt hashing, constant-time compare, dummy hash for unknown e-mails |
+| `src/http/auth.handlers.ts` | `POST /auth/login`, `/auth/refresh`, `/auth/logout`, `GET /auth/me` |
+| `src/auth/demo-auth.ts` / `demo-reuse.ts` / `demo-rbac.ts` / `demo-kit.ts` | `npm run demo:auth` / `demo:reuse` / `demo:rbac` + the shared start-the-app-and-clean-up kit |
+| `scripts/gen-jwt-keys.mjs` | `npm run keys:generate -- <env> [--rotate]` — keys into `secrets/<env>/`, prints fingerprints only |
+| `test/e2e/auth.e2e.test.js` / `test/testkit/auth.js` | auth regression tests; throwaway per-test-run signing keys |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -201,6 +216,8 @@ touches `process.env` directly.
 | `TIMEOUT_MS` | no | `5000` | `.env.example` | Postgres and Redis connection timeout, ms |
 | `REDIS_URL` | no | `redis://127.0.0.1:6379` | `.env.example`; with auth → the vault (`secrets/redis_url`) | the cache Redis (`allkeys-lru`) — HW #23 |
 | `REDIS_QUEUE_URL` | no | `redis://127.0.0.1:6380` | `.env.example`; with auth → the vault (`secrets/redis_queue_url`) | the state Redis (`noeviction`): sessions, rate limits, BullMQ — HW #23 |
+| `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `JWT_KID`, `REFRESH_TOKEN_PEPPER` | **yes** | — (none, on purpose) | the vault only — see [Auth](#auth) | HW #24 signing material |
+| `JWT_PREVIOUS_KID`, `JWT_PREVIOUS_PUBLIC_KEY` | no | — | the vault, during a key rotation | HW #24 overlap rotation |
 
 The DB password is deliberately **not** one of these variables — see
 [Secrets](#secrets) below for why.
@@ -241,7 +258,7 @@ moment they drift apart:
 
 ```bash
 npm run check:env
-# ✓ .env.example is in sync with the schema (7 variables)
+# ✓ .env.example is in sync with the schema (13 variables)
 ```
 
 ### Secrets
@@ -374,6 +391,20 @@ export REDIS_URL=redis://127.0.0.1:6379         # HW #23: redis-cache (allkeys-l
 export REDIS_QUEUE_URL=redis://127.0.0.1:6380   # HW #23: redis-queue (noeviction) — queue, sessions, rate limits
 export SKIP_VAULT=1    # у грейдера немає доступу до сховища
 
+# HW #24 — a ONE-OFF ES256 (P-256) key pair for this run; the real keys stay
+# in the vault. PEM travels base64, so the multi-line PEM survives `export`.
+node -e 'const {generateKeyPairSync}=require("node:crypto");
+const k=generateKeyPairSync("ec",{namedCurve:"P-256",
+  privateKeyEncoding:{type:"pkcs8",format:"pem"},
+  publicKeyEncoding:{type:"spki",format:"pem"}});
+const fs=require("node:fs");
+fs.writeFileSync("/tmp/priv.b64",Buffer.from(k.privateKey).toString("base64"));
+fs.writeFileSync("/tmp/pub.b64",Buffer.from(k.publicKey).toString("base64"));'
+export JWT_KID=grader
+export JWT_PRIVATE_KEY="$(cat /tmp/priv.b64)"
+export JWT_PUBLIC_KEY="$(cat /tmp/pub.b64)"
+export REFRESH_TOKEN_PEPPER="$(node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))')"
+
 npm run migrate
 npm run migrate:show
 npm run seed
@@ -403,9 +434,12 @@ npm run test:e2e
 npm run test:contract
 npm run verify:provider
 
-# HW #18 — realtime (no DB/docker needed for this part — see Realtime below)
-npm start &
-sleep 1
+# HW #18 — realtime. Since HW #24 it logs in as the seed's fixture accounts
+# (`npm run seed` above) and needs the keys exported above; app.js itself
+# connects via DB_URL + a password FILE (HW #11), hence the two lines below.
+printf %s "$DB_PASSWORD" > /tmp/marketplace_db_password
+DB_URL=postgres://admin@127.0.0.1:6432/marketplace DB_PASSWORD_FILE=/tmp/marketplace_db_password npm start &
+sleep 5
 node scripts/realtime-demo.mjs;             echo "exit=$?"
 node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
 kill %1
@@ -433,6 +467,14 @@ npm run demo:cache
 npm run demo:session
 npm run demo:ratelimit
 npm run demo:queue
+
+# HW #24 — auth (keys exported at the top; `npm run migrate` above applied
+# the Auth migration). Each demo starts its own app on a free port.
+npx tsc --noEmit
+npm run demo:auth
+npm run demo:reuse
+npm run demo:rbac
+npm run test:e2e
 ```
 
 (Port `6432`, not `5433` — every one of the commands above (`migrate`
@@ -1104,16 +1146,22 @@ not invent:
   let one connection claim a different userId on every join call and
   probe ownership one guess at a time; pinning it to the handshake ties
   one identity to one connection for its whole lifetime.
+- **Since HW #24 the identity is a verified token, not a typed-in string.**
+  `X-User-Id` and `auth: { userId }` are gone. `POST /orders` takes the
+  owner from the bearer token. The SSE route runs behind `requireAuth`.
+  The socket.io handshake verifies `auth: { token }` (signature +
+  revocation) and refuses the connection otherwise. Every order now has an
+  owner, and the rule on all three paths is "the owner or an admin" (see
+  [Auth](#auth)).
 
 ### Last-Event-ID, proven with 5 real events
 
-`order_1` below was created **with** `X-User-Id: tester` (see
-[No ownership concept existed](#no-nest-here-either) just above), so its
-stream enforces that owner — an anonymously-created order's stream would
-need no header at all.
+`order_1` below belongs to the caller whose access token is in `$ACCESS`
+(since HW #24, from `POST /auth/login`. Before that, it was an
+`X-User-Id: tester` header).
 
 ```
-curl -sN --max-time 2 -H 'Last-Event-ID: 3' -H 'X-User-Id: tester' http://localhost:3000/orders/order_1/events | grep '^id:'
+curl -sN --max-time 2 -H 'Last-Event-ID: 3' -H "Authorization: Bearer $ACCESS" http://localhost:3000/orders/order_1/events | grep '^id:'
 # id: 4
 ```
 
@@ -1738,15 +1786,16 @@ validator covers them like every other route.
 | Route | What Redis does | New responses |
 |---|---|---|
 | `GET /product-cards/{productId}` | cache-aside + single-flight + stale-while-revalidate; limit 60/min per IP | `429` + `Retry-After`, `503` + `Retry-After` (`CacheBusyError`) |
-| `POST /sessions` `{email}` | creates `sess:<sha256>`, sets the `sid` cookie; limit 10/min per IP | `401` (unknown e-mail is the same 401 as any other failure), `429` |
+| `POST /sessions` `{email, password}` | creates `sess:<sha256>`, sets the `sid` cookie; limit 10/min per (IP, e-mail) | `401` (unknown e-mail is the same 401 as any other failure), `429` |
 | `GET /sessions/current` | `GETEX` → rolls the idle TTL | `401` |
 | `DELETE /sessions/current` | deletes the session, clears the cookie | `204`, `401` |
 | `POST /checkout` | after commit, `markStale()` on the product's card | — |
 
-- **Login is by e-mail only.** The schema has no passwords yet, and
-  HW #24 adds real authentication on top of this same session. Until
-  then, the endpoint is rate-limited and doesn't reveal which e-mails
-  exist.
+- **Login checks the password** (since HW #24), through the same
+  verifier as `POST /auth/login`. The cookie session and the token pair
+  are two ways to carry the result of one credential check. Until HW #24,
+  this login took an e-mail alone. An unknown e-mail is still the same
+  401, so the endpoint doesn't reveal which e-mails exist.
 - The 429 and 401 go through `next(err)` into the same problem+json filter
   as every other error, never a hand-written body. That keeps the
   response validator seeing the full `Problem` shape. The 503 is marked
@@ -1792,6 +1841,338 @@ npm run test:e2e
   consumer side (HW #22), with the jobId taken from the `eventId` it
   already carries. `npm run queue:worker` processes the queue on its own.
 
+## Auth
+
+### Two separate questions
+
+HW #24 closes the API, and it answers two different questions in two
+different places:
+
+- **Authentication** answers "who is this?" with a fact that cryptography
+  can check: the signature verifies, the token hasn't expired, and it
+  hasn't been revoked. A failure gives **401**. The code is in
+  `src/auth/` (`AuthService`, `requireAuth`).
+- **Authorization** answers "may they do this?" with a decision that
+  depends on data the token doesn't carry, such as who owns a given order.
+  A failure gives **403**. The code is in `requireRole` and in the
+  handlers.
+
+The two status codes are kept strictly apart. A client SDK answers 401
+by refreshing its token and 403 by showing an error. If they were mixed
+up, the app would either loop on refresh or log the user out on every
+page that isn't theirs.
+
+### What's protected
+
+| Domain role | Here | Rule | Outcome |
+|---|---|---|---|
+| a resource with an owner | `orders`: `GET /orders/{id}`, its SSE stream, its WebSocket room | owner or admin | someone else's → **403** |
+| a list with an owner | `GET /orders` | filtered by owner (admins see all) | — |
+| written only by a privileged role | `products`: `POST /products`; also `PATCH /orders/{id}/status` | `seller` or `admin` | a buyer → **403** |
+| acting "as" a user | `POST /orders`, `POST /checkout` | the owner/buyer **is the token's `sub`** | — |
+| public | `GET /products…`, `GET /product-cards/{id}`, `/auth/login`, `/auth/refresh`, `/health` | — | — |
+
+Before this HW, `POST /orders` took its owner from an `X-User-Id` header
+and `POST /checkout` took the buyer from a body field. So "on behalf of
+whoever you typed in" was the actual rule. Both now come from the
+verified token. The realtime layer (HW #18) follows the same rule:
+`requireAuth` runs in front of the SSE route, and the socket.io
+**handshake** verifies `auth: { token }`. A socket without a valid token
+never connects, and the old `auth: { userId }` gets `unauthorized`.
+
+### Variables
+
+The private key, kid and pepper never live in `.env`. `.env.example`
+lists them empty, only so that `check:env` stays honest.
+
+| Змінна | Джерело | Формат | Навіщо |
+|---|---|---|---|
+| `JWT_PRIVATE_KEY` | сховище (#11): `secrets/<env>/jwt_private_key.b64` | base64 PEM, EC P-256 PKCS#8 | підпис access-токенів (ES256) |
+| `JWT_PUBLIC_KEY` | сховище (#11): `secrets/<env>/jwt_public_key.b64` | base64 PEM, SPKI | перевірка підпису |
+| `JWT_KID` | сховище (#11): `secrets/<env>/jwt_kid` | `[A-Za-z0-9._-]{1,64}` | `kid` у заголовку кожного токена |
+| `REFRESH_TOKEN_PEPPER` | сховище (#11): `secrets/<env>/refresh_token_pepper` | ≥ 32 символи | ключ HMAC для `token_hash` refresh-токенів |
+| `JWT_PREVIOUS_KID` / `JWT_PREVIOUS_PUBLIC_KEY` | сховище (#11), лише під час ротації ключа | як вище | перевірка токенів, підписаних попереднім ключем |
+| `DB_URL`, `DB_PASSWORD_FILE` | `.env` / compose (HW #11) | — | Postgres; дев-креденшели, секретом не є |
+| `REDIS_URL`, `REDIS_QUEUE_URL` | `.env` / compose (HW #23) | — | Redis; дев-адреси без пароля |
+
+- **No defaults for anything signing-related.** A default for a signing key
+  is the same thing as a key hardcoded in the repo. The zod schema
+  (`src/config/env.schema.js`) has none.
+- **The config is validated first.** Bare `npm run start` without these
+  variables exits non-zero **before** connecting to Postgres, and names
+  them:
+  ```
+  ✗ App is not starting — invalid configuration.
+    JWT_PRIVATE_KEY: ES256 private key, base64 PEM (PKCS#8) — comes from the vault (scripts/with-secrets.sh, secrets/<env>/), never from .env
+    …
+  ```
+- **The schema also parses the keys at boot.** It checks that both keys
+  are P-256 and that the private key matches the public one (a test
+  sign/verify). A broken key stops the start, rather than failing the
+  first login an hour later.
+- **`npm run start:vault`** and all three demos run through
+  `bash scripts/with-secrets.sh dev …`, which reads `secrets/dev/`.
+  `SKIP_VAULT=1` is the existing escape hatch.
+  `npm run keys:generate -- <env>` creates an environment's keys. It never
+  overwrites them, and it prints only fingerprints.
+- **Why a signing key is a different class of secret.** A leaked
+  `DATABASE_URL` gives network access to the database. A leaked signing
+  key lets someone mint a token for **anyone**, without any access to
+  anything.
+
+### Fingerprints: dev and prod are different keys
+
+The app prints which key it signs with at startup. The kid and the
+fingerprint (SHA-256 of the public key's SPKI DER) are safe to log, since
+neither can be turned back into the key:
+
+```bash
+npm run start:vault                                # dev
+# [info] auth: signing kid=dev-20261116-d10c SHA256:02FHIYbs36I9UXzYvx67L6D3hPxtKHYGPgyjMrM5zH0
+bash scripts/with-secrets.sh prod node app.js      # prod
+# [info] auth: signing kid=prod-20261116-5ef9 SHA256:0hv6IcNd5Oi4SoOlOpE2uFPJY9R9NR+xl5+IuAxArzs
+```
+
+Two different fingerprints mean the environments don't share a key. A
+token minted in dev is a token with an unknown `kid` in prod, and gets
+401.
+
+### Algorithm: ES256, with an explicit allowlist
+
+**ES256** (ECDSA P-256), not RS256. OWASP marks RS256 (PKCS#1 v1.5) as
+"not recommended" and recommends ES256 / PS256 / EdDSA instead. ES256 is
+the one of those every JWT library and JWKS consumer supports. It also
+has 64-byte signatures and small keys, which shortens every token.
+Asymmetric means the services that only *verify* tokens get the public
+key and nothing else, so no verifier can mint itself a `role: admin`.
+
+Verification runs `jwt.verify(token, key, { algorithms: ['ES256'], issuer,
+audience })` (`src/auth/tokens.ts`). The **allowlist** is what RFC 8725
+§3.1 requires: the verifier decides the algorithm, never the token. The
+key is chosen by the header's `kid` from a keyring. A `kid` the app
+doesn't know is rejected before any verification happens. `demo:rbac`
+shows this behaviourally:
+
+- `tampered=401`: the payload is edited to `role → admin` and the old
+  signature kept. A server that only runs `jwt.decode()` would answer 201.
+- `alg-none=401`: the same token re-wrapped as `alg: none`.
+- `alg-hs256=401`: the same token re-wrapped as HS256, keyed with our
+  *public* key as the HMAC secret (the classic algorithm confusion).
+
+### Tokens
+
+- **access**: an ES256 JWT that lives **10 min**. Claims: `sub`, `role`,
+  `fid` (family id), `jti`, `iss`, `aud`, `exp`; header `kid`.
+- **refresh**: 32 random bytes, base64url. Opaque, **not a JWT**, and
+  lives 14 days. The database stores only
+  `token_hash = HMAC-SHA256(REFRESH_TOKEN_PEPPER, token)`. A dump of
+  `refresh_tokens` is not a dump of live sessions, and even with the whole
+  database leaked it can't be matched to anything without the pepper,
+  which never lives in the database.
+- **Passwords** are hashed with scrypt from `node:crypto` (N=2¹⁵, r=8). An
+  unknown e-mail still costs one scrypt run, so response time doesn't
+  reveal which e-mails exist, and it gets the same 401 as a wrong
+  password. `/auth/login` is rate-limited per (IP, e-mail) through the
+  HW #23 limiter.
+- Nothing logs a token. Audit lines carry `user_id`, `family_id` and `jti`
+  only, and `demo:reuse` checks this (`token-in-log=0`).
+
+### Refresh rotation with reuse detection
+
+Every successful refresh returns a new pair and retires the presented
+token (`used_at`, `replaced_by`). Every token of one login shares a
+`family_id`. RFC 9700 §4.14.2 requires either sender-constrained tokens
+or **rotation with replay detection**. In the second case the link from
+old token to new one exists precisely so that a detected replay has
+something to revoke.
+
+`AuthService.refresh()` runs in **one transaction**:
+
+1. `SELECT … FOR UPDATE` on the token's row. Two concurrent refreshes with
+   the same token serialise here.
+2. If the token is unknown, expired or its family is already revoked →
+   401.
+3. If the token is **already used**, someone holds a copy. **Revoke the
+   whole family**, write an audit line, return 401:
+   ```
+   [warn] [auth] {"event":"refresh_token_reuse_detected","user_id":"141","family_id":"f31b318d-…","token_id":"481a4364-…","first_used_at":"…","tokens_revoked":2}
+   ```
+4. Otherwise mark the token used, insert its successor in the same family,
+   `COMMIT`, and return the pair. The role is re-read from `users` at this
+   step.
+
+Rotation **without** a family does nothing against theft. The thief
+refreshes first, the honest client gets a 401 and quietly logs in again,
+and the thief's session lives on. With the family, both get logged out,
+and the event is in the log.
+
+**Client race: no grace window. The client must serialise refresh.** Two
+requests that refresh the same token in parallel look exactly like a
+replay, and the server can't tell them apart. So the client keeps **one
+in-flight refresh promise** that every request waits on. In an Angular
+`HttpInterceptor`, for example, that's a shared `Observable` with
+`shareReplay(1)` that is reset once it settles. A few-second grace window
+that returns the same new pair would work too. But during that window a
+thief racing the honest client goes unnoticed, and it needs the new pair
+stored server-side. I chose the strict variant.
+
+### Logout is two actions, and why
+
+```
+POST /auth/logout   (Authorization: Bearer <access>)
+  BEGIN
+    UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $fid AND revoked_at IS NULL
+    INSERT INTO revoked_access_tokens (jti, user_id, expires_at) VALUES ($jti, $sub, to_timestamp($exp))
+    DELETE FROM revoked_access_tokens WHERE expires_at < now()
+  COMMIT
+```
+
+The two tokens die differently:
+
+- **The refresh token is a row.** Setting `revoked_at` is enough, because
+  the server looks it up on every use.
+- **The access token is self-contained.** Nobody looks it up: a valid
+  signature and `exp` make it valid on their own, for up to 10 more
+  minutes. The only way to kill it earlier is a **denylist** of its `jti`,
+  kept until its `exp` and not a second longer. The `DELETE` of expired
+  entries is that TTL, so the table doesn't grow forever.
+
+**The denylist lives in Postgres, in the same database and the same
+transaction as the family revocation.** The two actions commit or roll
+back together. With the denylist in Redis and the revocation in Postgres
+they'd be a dual write (HW #22's lesson). It could be ordered and made
+retryable, but it couldn't be called atomic.
+
+On every authenticated request, `requireAuth` runs one query: is this
+`jti` denylisted, **or** is its family revoked? The family check is what
+makes a logout (or a detected reuse) also kill the family's *older*
+access tokens. `demo:auth` shows this as `first-access-after-logout=401`,
+and `demo:reuse` as `a2-after-reuse=401`.
+
+That query is the price, and it's paid on purpose. RFC 7009 §3 says the
+cost of revocation is a consequence of the security properties you want,
+not a constant. A short TTL alone would be stateless, but a stolen token
+would live for up to 10 minutes. An opaque token would mean an
+introspection call on every request. This is the middle option: a
+stateless signature check plus one indexed lookup. If the database is
+down, that's a **500, not a 401**, so clients don't fall into a refresh
+loop during an outage.
+
+### Ownership is not a guard
+
+The role check is a guard (`requireRole('seller', 'admin')`), because the
+role is in the token and is known before any data is loaded. **Ownership
+isn't**, because a guard runs before the order is loaded and has no
+owner to compare with. It would have to load the order itself, which
+means querying twice. The check runs in the handler right after the load:
+
+```js
+if (order.userId !== req.auth.sub && req.auth.role !== 'admin') → 403
+```
+
+The same goes for the SSE route and the WebSocket join. Lists are
+filtered in the query itself (`GET /orders` returns the caller's own
+orders). Against a database, that's `WHERE id = $1 AND user_id = $sub`, so
+someone else's row is never even loaded.
+
+### The role in the token is a cache
+
+`users.role` is the source of truth. The token carries a **copy taken at
+issue time**. A freshly demoted admin **stays admin until their access
+token's `exp`, for up to 10 minutes**, and loses the role at the next
+refresh, because the refresh re-reads `users.role`. That's a deliberate
+trade-off: a database lookup of the role on every request would cost as
+much as an opaque token. If 10 minutes is too long for an incident, the
+fix is to revoke the user's families (as logout does). Their tokens then
+die on the next request through the family check, and the next login
+picks up the new role.
+
+### Signing-key rotation: overlap and `kid`
+
+Every token's header carries the `kid` of the key that signed it, and the
+verifier keeps a **keyring** of kid → public key. A rotation is an
+**overlap**, never a switch:
+
+1. `npm run keys:generate -- prod --rotate`. The current public key and
+   kid move to `jwt_previous_*`, and a new pair becomes the signing key.
+   The pepper is **kept**, since rotating it would invalidate every
+   refresh token at once, which is a separate "log everyone out" action.
+2. Deploy. New tokens are signed with the new kid. Tokens signed by the
+   old key still verify via `JWT_PREVIOUS_KID` / `JWT_PREVIOUS_PUBLIC_KEY`.
+3. After **one access-token lifetime (10 min) plus clock skew**, nothing
+   signed by the old key is still alive. Remove `jwt_previous_*` and
+   deploy again.
+
+Without `kid`, the verifier would have to try every key it knows. Without
+the overlap, every user would get a 401 at the moment of the switch. The
+startup line logs every kid in play with its fingerprint.
+
+### The three demos, this run's numbers
+
+Each demo cleans up its own previous run, creates its own users, starts
+the real `node app.js` on a free port, talks to it over HTTP only, then
+kills it and deletes its users (with their tokens, through
+`ON DELETE CASCADE`). The numbers are HTTP statuses, so they're
+deterministic.
+
+```bash
+npm run demo:auth
+# login=200
+# no-token=401
+# with-token=200
+# refresh=200
+# logout=204
+# after-logout=401               # the denylist: without it, this token works until exp
+# refresh-after-logout=401       # the family is revoked
+# first-access-after-logout=401  # the access token from BEFORE the refresh: same family, dead too
+
+npm run demo:reuse
+# login=200
+# r1-refresh=200
+# a2-before-reuse=200
+# r1-reuse=401                   # the replay
+# r2-after-reuse=401             # the honest client's token died too: the whole family
+# a2-after-reuse=401             # and the family's access tokens
+# reuse-logged=1
+# token-in-log=0
+
+npm run demo:rbac
+# anon=401                       # no token: who are you?
+# own=200
+# foreign=403                    # ownership, checked after the load
+# role-denied=403                # buyer → POST /products
+# role-allowed=201               # seller → POST /products
+# tampered=401                   # role→admin in the payload, old signature kept
+# alg-none=401
+# alg-hs256=401
+```
+
+`test/e2e/auth.e2e.test.js` covers the same flows as regression tests,
+plus what the demos don't print:
+- the refresh token is stored as a 64-hex HMAC, not as the token;
+- a wrong password and an unknown e-mail give the same 401;
+- logging out on one device leaves another login working;
+- an expired token gets 401.
+
+The other suites now authenticate too:
+- `app.e2e` gets a seller token for `POST /products`, plus a new
+  401-vs-403 case.
+- In `redis.e2e`, checkout uses a token and the session login checks the
+  password.
+- Pact: the consumer contract now says `Authorization: Bearer …` (a
+  matcher, not a value). Provider verification swaps in a token it
+  actually issues (`requestFilter`).
+
+### Not done
+
+- **Bonus (ReBAC tuples) is not implemented.**
+- **No refresh-token family garbage collection.** Expired and revoked
+  rows stay in `refresh_tokens`. A periodic
+  `DELETE … WHERE expires_at < now() - interval '1 day'` is the obvious
+  job, and the HW #23 queue scheduler would be its natural home.
+- **Sender-constrained tokens (DPoP / mTLS)** are the other branch of
+  RFC 9700 §4.14.2, and this HW took the rotation branch instead.
+
 ## Verification (acceptance criteria)
 
 Spec is valid:
@@ -1810,9 +2191,10 @@ const ops=Object.entries(s.paths).flatMap(([p,v])=>Object.keys(v).filter(m=>M.in
 const idem=ops.flatMap(([p,m])=>s.paths[p][m].parameters??[]).find(x=>x.in==='header'&&/idempotency-key/i.test(x.name));\
 console.log('operations:',ops.length,'· resources:',new Set(Object.keys(s.paths).map(p=>p.split('/')[1])).size);\
 console.log('Idempotency-Key: required =',idem?.required,'· description length =',(idem?.description??'').trim().length)"
-# expected: operations: 13 · resources: 5 · required = true · description length = 393
+# expected: operations: 17 · resources: 6 · required = true · description length = 393
 # (HW #9 shipped 6 · 2; HW #18 added PATCH …/status + GET …/events, HW #19 POST /checkout,
-#  HW #23 GET /product-cards/{id} + POST /sessions + GET/DELETE /sessions/current.
+#  HW #23 GET /product-cards/{id} + POST /sessions + GET/DELETE /sessions/current,
+#  HW #24 POST /auth/login + /auth/refresh + /auth/logout + GET /auth/me.
 #  The first Idempotency-Key found is still POST /orders' — hence the same 393)
 ```
 

@@ -10,6 +10,9 @@ const os = require('node:os');
 const { GenericContainer, Wait } = require('testcontainers');
 const request = require('supertest');
 const { startPg } = require('../integration/testkit/container');
+const { useThrowawayAuthKeys, signAccessToken } = require('../testkit/auth');
+
+const PASSWORD = 'redis-e2e-password';
 
 function startRedis(policy) {
   return new GenericContainer('redis:8.4-alpine')
@@ -41,6 +44,7 @@ describe('E2E: Redis-backed routes in the real app (HW #23)', () => {
     process.env.REDIS_URL = `redis://${cacheBox.getHost()}:${cacheBox.getMappedPort(6379)}`;
     process.env.REDIS_QUEUE_URL = `redis://${stateBox.getHost()}:${stateBox.getMappedPort(6379)}`;
     process.env.LOG_LEVEL = 'error';
+    useThrowawayAuthKeys();
 
     ({ closeResources } = require('../../app'));
     app = require('../../app').createApp();
@@ -53,9 +57,10 @@ describe('E2E: Redis-backed routes in the real app (HW #23)', () => {
   });
 
   async function insertUser(email, balanceCents = 1_000_000) {
+    const { hashPassword } = require('../../dist/auth/password');
     const { rows } = await pg.pool.query(
-      `INSERT INTO users (email, full_name, balance_cents) VALUES ($1, 'Redis E2E', $2) RETURNING id::text AS id`,
-      [email, balanceCents],
+      `INSERT INTO users (email, full_name, balance_cents, password_hash) VALUES ($1, 'Redis E2E', $2, $3) RETURNING id::text AS id`,
+      [email, balanceCents, await hashPassword(PASSWORD)],
     );
     return rows[0].id;
   }
@@ -92,7 +97,8 @@ describe('E2E: Redis-backed routes in the real app (HW #23)', () => {
     await request(app)
       .post('/checkout')
       .set('Idempotency-Key', `redis-e2e-${Date.now()}`)
-      .send({ user_id: userId, product_id: id, quantity: 2 })
+      .set('Authorization', `Bearer ${signAccessToken(userId)}`) // HW #24: the buyer is the token's subject
+      .send({ product_id: id, quantity: 2 })
       .expect(201);
 
     const after = await request(app).get(`/product-cards/${id}`).expect(200);
@@ -104,7 +110,8 @@ describe('E2E: Redis-backed routes in the real app (HW #23)', () => {
     const userId = await insertUser(email);
     const agent = request.agent(app);
 
-    const login = await agent.post('/sessions').send({ email }).expect(201);
+    await agent.post('/sessions').send({ email, password: 'wrong' }).expect(401);
+    const login = await agent.post('/sessions').send({ email, password: PASSWORD }).expect(201);
     expect(login.body).toEqual({ user_id: userId, idle_timeout_seconds: 1800 });
     expect(login.headers['set-cookie'][0]).toMatch(/^sid=[\w-]{43}; HttpOnly; SameSite=Lax; Path=\//);
 
@@ -121,13 +128,13 @@ describe('E2E: Redis-backed routes in the real app (HW #23)', () => {
 
   test('unknown e-mail → 401 (not 404); 11th login attempt in a minute → 429 + Retry-After', async () => {
     // a fresh limiter bucket: other tests in this file logged in from the same IP
-    await request(app).post('/sessions').send({ email: 'nobody@example.test' }).expect((res) => {
+    await request(app).post('/sessions').send({ email: 'nobody@example.test', password: 'whatever' }).expect((res) => {
       expect([401, 429]).toContain(res.status);
     });
     const statuses = [];
     let limited;
     for (let i = 0; i < 11; i++) {
-      const res = await request(app).post('/sessions').send({ email: 'nobody@example.test' });
+      const res = await request(app).post('/sessions').send({ email: 'nobody@example.test', password: 'whatever' });
       statuses.push(res.status);
       if (res.status === 429) limited = res;
     }

@@ -11,14 +11,22 @@ import { User } from './entities/user.entity';
 import { Product } from './entities/product.entity';
 import { Order, OrderStatus } from './entities/order.entity';
 import { OrderItem } from './entities/order-item.entity';
+import { hashPassword } from './auth/password';
+
+// HW #24: roles + a login for the fixture accounts. The password is a DEV
+// FIXTURE, the same class of value as docker-compose.yml's
+// admin-bootstrap-only: it only ever exists in a local database this seed
+// built, it is not a secret of any real environment. (Real users don't
+// come from a seed.) scripts/realtime-demo.mjs logs in with it.
+export const DEV_SEED_PASSWORD = 'marketplace-dev-password';
 
 const USERS = [
-  { email: 'ada@example.test', fullName: 'Ada Lovelace' },
-  { email: 'grace@example.test', fullName: 'Grace Hopper' },
-  { email: 'alan@example.test', fullName: 'Alan Turing' },
-  { email: 'margaret@example.test', fullName: 'Margaret Hamilton' },
-  { email: 'katherine@example.test', fullName: 'Katherine Johnson' },
-];
+  { email: 'ada@example.test', fullName: 'Ada Lovelace', role: 'admin' },
+  { email: 'grace@example.test', fullName: 'Grace Hopper', role: 'seller' },
+  { email: 'alan@example.test', fullName: 'Alan Turing', role: 'buyer' },
+  { email: 'margaret@example.test', fullName: 'Margaret Hamilton', role: 'buyer' },
+  { email: 'katherine@example.test', fullName: 'Katherine Johnson', role: 'buyer' },
+] as const;
 
 const PRODUCTS = [
   { name: 'Механічна клавіатура', description: 'Ігрова клавіатура з механічними перемикачами.', priceCents: 249900 },
@@ -56,6 +64,13 @@ async function main(): Promise<void> {
   for (const u of USERS) {
     let user = await userRepo.findOneBy({ email: u.email });
     if (!user) user = await userRepo.save(userRepo.create(u));
+    if (user.role !== u.role) await userRepo.update(user.id, { role: u.role });
+    // password only where there is none: re-running the seed doesn't
+    // re-hash (scrypt is deliberately slow) or overwrite a changed one
+    await AppDataSource.query(`UPDATE users SET password_hash = $2 WHERE id = $1 AND password_hash IS NULL`, [
+      user.id,
+      await hashPassword(DEV_SEED_PASSWORD),
+    ]);
     users.push(user);
   }
 

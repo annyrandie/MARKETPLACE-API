@@ -16,6 +16,10 @@ export interface OwnedOrder {
 
 export type OrderLookup = (orderId: string) => OwnedOrder | undefined;
 
+/** HW #24: the same check every HTTP request goes through (signature +
+ *  revocation) — resolves to the caller, rejects on a bad token. */
+export type Authenticate = (token: string) => Promise<{ sub: string; role: string }>;
+
 export interface JoinAck {
   ok: boolean;
   room?: string;
@@ -26,6 +30,7 @@ export function attachOrdersGateway(
   httpServer: HttpServer,
   events: OrderEventsService,
   getOrder: OrderLookup,
+  authenticate: Authenticate,
 ): SocketIoServer {
   // No CORS config: realtime-demo.mjs is a Node process (socket.io-client
   // outside a browser never enforces CORS at all), and this app has no
@@ -38,18 +43,27 @@ export function attachOrdersGateway(
   // exposure than the "equivalent" transport next to it.
   const io = new SocketIoServer(httpServer);
 
+  // HW #24: authentication happens in the HANDSHAKE — a socket without a
+  // valid bearer token (`auth: { token }`) never connects at all; the
+  // client gets connect_error "unauthorized". Same 401 semantics as HTTP.
+  io.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+    if (typeof token !== 'string') return next(new Error('unauthorized'));
+    authenticate(token)
+      .then((caller) => {
+        socket.data.caller = caller;
+        next();
+      })
+      .catch(() => next(new Error('unauthorized')));
+  });
+
   io.on('connection', (socket) => {
-    // Identity is read ONCE, at connection time, from the handshake — not
-    // from the `join` payload. A payload field is just a string the
-    // client typed into the SAME message asking to join; "someone else's
-    // order" would otherwise mean nothing more than "a client that didn't
-    // guess the right userId string this one time" — it could claim a
-    // DIFFERENT userId on every join call over the same connection and
-    // probe every order's ownership one guess at a time. Pinning identity
-    // to the handshake (auth payload, same as a real session/JWT would
-    // arrive) ties exactly one identity to this socket for its whole
-    // lifetime, which is what makes "forbidden" actually mean something.
-    const userId = socket.handshake.auth?.userId ?? socket.handshake.query?.userId;
+    // Identity is fixed ONCE, at the handshake (io.use above), from a
+    // verified token — never from the `join` payload, where a client could
+    // claim a different user on every call and probe every order's
+    // ownership one guess at a time. Before HW #24 the handshake carried a
+    // bare userId string; now it's the signed `sub`.
+    const caller = socket.data.caller as { sub: string; role: string };
 
     socket.on('join', (payload: { orderId?: string } | undefined, ack?: (res: JoinAck) => void) => {
       const orderId = payload?.orderId;
@@ -59,16 +73,9 @@ export function attachOrdersGateway(
         ack?.({ ok: false, reason: 'not_found' });
         return;
       }
-      // Ownership is enforced only when the order actually HAS an owner
-      // — same rule orders.controller.ts's SSE route uses, for the same
-      // reason: an order created without X-User-Id has no owner to check
-      // against and is already public via plain GET /orders/:id, so
-      // refusing every joiner for it (an earlier revision did exactly
-      // that, unconditionally) made WebSocket the one transport that was
-      // STRICTER than the "equivalent" SSE stream for the identical
-      // resource, not just differently guarded. Someone else's order —
-      // one that DOES have an owner — is still refused exactly as before.
-      if (order.userId && order.userId !== userId) {
+      // Ownership — the same rule as GET /orders/:id and the SSE stream:
+      // the owner or an admin. Someone else's order → forbidden.
+      if (order.userId && order.userId !== caller.sub && caller.role !== 'admin') {
         ack?.({ ok: false, reason: 'forbidden' });
         return;
       }

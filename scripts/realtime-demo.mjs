@@ -9,18 +9,35 @@
 // Order of operations matters (see README): connect -> join -> wait for
 // the join ack -> only THEN change the status. Changing status before a
 // client's join has been acknowledged races the event past an empty room.
+//
+// HW #24: identities are real logins now (the seed's fixture accounts —
+// `npm run seed` first), not an X-User-Id header / handshake string anyone
+// could type: orders are created with a bearer token, the socket handshake
+// carries the same token, and the status change is made by a seller.
 import { io as ioClient } from 'socket.io-client';
 
 const BASE_URL = process.env.REALTIME_DEMO_URL || 'http://localhost:3000';
 const sameRoom = process.argv.includes('--same-room');
+// the seed's dev-fixture password (src/seed.ts, DEV_SEED_PASSWORD)
+const DEV_SEED_PASSWORD = process.env.DEV_SEED_PASSWORD || 'marketplace-dev-password';
 
-async function createOrder(userId) {
+async function login(email) {
+  const res = await fetch(`${BASE_URL}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password: DEV_SEED_PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`login ${email} failed: ${res.status} ${await res.text()} — did you run npm run seed?`);
+  return (await res.json()).access_token;
+}
+
+async function createOrder(token) {
   const res = await fetch(`${BASE_URL}/orders`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Idempotency-Key': `realtime-demo-${userId}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      'X-User-Id': userId,
+      'Idempotency-Key': `realtime-demo-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify({ items: [{ product_id: 'prod_1', quantity: 1 }] }),
   });
@@ -28,22 +45,21 @@ async function createOrder(userId) {
   return (await res.json()).id;
 }
 
-async function setStatus(orderId, status) {
+async function setStatus(orderId, status, sellerToken) {
   const res = await fetch(`${BASE_URL}/orders/${orderId}/status`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sellerToken}` },
     body: JSON.stringify({ status }),
   });
   if (!res.ok) throw new Error(`status change failed: ${res.status} ${await res.text()}`);
 }
 
-function connectAndJoin(orderId, userId) {
+function connectAndJoin(orderId, token) {
   return new Promise((resolve, reject) => {
-    // userId travels in the handshake (`auth`), not in the `join` payload
-    // — the gateway (orders.gateway.ts) reads identity once per
-    // connection from here, exactly so a client can't just try a
-    // different userId string per join call. See that file's comment.
-    const socket = ioClient(BASE_URL, { transports: ['websocket'], reconnection: false, auth: { userId } });
+    // the token travels in the handshake (`auth`), not in the `join`
+    // payload — the gateway (orders.gateway.ts) verifies it once per
+    // connection, so identity can't change from one join call to the next.
+    const socket = ioClient(BASE_URL, { transports: ['websocket'], reconnection: false, auth: { token } });
     let received = false;
     socket.on('order.status', () => {
       received = true;
@@ -62,22 +78,20 @@ function connectAndJoin(orderId, userId) {
 }
 
 async function main() {
-  const userA = 'realtime-demo-user-a';
-  const userB = 'realtime-demo-user-b';
+  const tokenA = await login('alan@example.test'); // buyer
+  const tokenB = await login('margaret@example.test'); // another buyer
+  const sellerToken = await login('grace@example.test'); // changes status
 
-  const orderA = await createOrder(userA);
-  const orderB = await createOrder(userB);
+  const orderA = await createOrder(tokenA);
+  const orderB = await createOrder(tokenB);
 
-  // The one line --same-room changes: which room (and, since a real
-  // ownership guard gates joins, which identity) client B uses. Both runs
-  // share every other line of this script.
   const roomOrderIdForB = sameRoom ? orderA : orderB;
-  const identityForB = sameRoom ? userA : userB;
+  const identityForB = sameRoom ? tokenA : tokenB;
 
-  const clientA = await connectAndJoin(orderA, userA);
+  const clientA = await connectAndJoin(orderA, tokenA);
   const clientB = await connectAndJoin(roomOrderIdForB, identityForB);
 
-  await setStatus(orderA, 'completed');
+  await setStatus(orderA, 'completed', sellerToken);
   await new Promise((resolve) => setTimeout(resolve, 400));
 
   const aReceived = clientA.didReceive() ? 1 : 0;
