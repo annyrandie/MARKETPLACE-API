@@ -111,9 +111,9 @@ export function sessionMiddleware(store: RedisSessionStore) {
   };
 }
 
-export function requireSession(req: Request, res: Response, next: NextFunction): void {
+export function requireSession(req: Request, _res: Response, next: NextFunction): void {
   if (!req.session) {
-    res.status(401).type('application/problem+json').json({ title: 'Unauthorized', status: 401 });
+    next(Object.assign(new Error('no valid session — log in via POST /sessions'), { status: 401 }));
     return;
   }
   next();

@@ -18,6 +18,13 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
   TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+
+  // HW #23: two Redis instances with opposite eviction policies — never
+  // one URL with a different DB index (maxmemory-policy is per process).
+  // The cache box may forget (allkeys-lru); the state box holds sessions
+  // and rate-limit counters, which must not be evicted (noeviction).
+  REDIS_URL: z.url({ protocol: /^rediss?$/ }).default('redis://127.0.0.1:6379'),
+  REDIS_QUEUE_URL: z.url({ protocol: /^rediss?$/ }).default('redis://127.0.0.1:6380'),
 });
 
 /** @param {Record<string, unknown>} raw

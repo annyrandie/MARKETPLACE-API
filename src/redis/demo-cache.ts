@@ -5,19 +5,28 @@
 // 2. warms WARM_KEYS cards and counts distinct TTLs (jitter or not);
 // 3. deletes one warm key ("just expired") and fires CONCURRENT requests at
 //    it through PODS separate Redis connections — db-calls must be 1;
-// 4. 100 more reads of the warm cache — db-calls-warm must be 0.
+// 4. 100 more reads of the warm cache — db-calls-warm must be 0;
+// 5. slow DB (1 s loader), key gone, nothing stale to serve: still ONE DB
+//    call — callers that can't be served within waitTimeoutMs get
+//    CacheBusyError (→ 503 in app.js), they do NOT all fall through to
+//    the DB after the wait;
+// 6. slow DB, key stale (markStale, as after a checkout) and the product
+//    renamed in the DB: one caller reloads, the rest get the old copy
+//    immediately (stale-while-revalidate).
 // db-calls is counted per statement sent to Postgres (CountingQueryable),
 // not per function call. Self-cleaning: own fixture products, own keys.
 import { createDbPool } from '../events/db';
 import { finish } from '../outbox/demo-kit';
 import { createCacheRedis, readMemoryConfig } from './connections';
-import { CacheAside, DEFAULT_CACHE_OPTIONS } from './cache';
+import { CacheAside, CacheBusyError, DEFAULT_CACHE_OPTIONS } from './cache';
 import { CountingQueryable, ProductCardRepository, productCardKey } from '../repositories/product-card.repository';
 
 const WARM_KEYS = 60;
 const CONCURRENT = 25;
 const PODS = 5;
 const WARM_READS = 100;
+const SLOW_DB_MS = 1000;
+const WAIT_TIMEOUT_MS = 300;
 const MARKER = 'redis demo fixture: cache';
 // control run: `node dist/redis/demo-cache.js --no-lock` — same stampede,
 // no single-flight; db-calls jumps to CONCURRENT and the invariant fails.
@@ -49,6 +58,13 @@ async function main(): Promise<void> {
   const repo = new ProductCardRepository(db);
   const caches = pods.map((r) => new CacheAside(r, { ...DEFAULT_CACHE_OPTIONS, singleFlight: !NO_LOCK }));
   const getCard = (podIdx: number, id: string) => caches[podIdx % PODS].get(productCardKey(id), () => repo.findCard(id));
+  // same pods, but callers give up after WAIT_TIMEOUT_MS and the DB takes SLOW_DB_MS
+  const impatient = pods.map((r) => new CacheAside(r, { ...DEFAULT_CACHE_OPTIONS, waitTimeoutMs: WAIT_TIMEOUT_MS }));
+  const getCardSlowDb = (podIdx: number, id: string) =>
+    impatient[podIdx % PODS].get(productCardKey(id), async () => {
+      await new Promise((r) => setTimeout(r, SLOW_DB_MS));
+      return repo.findCard(id);
+    });
 
   let summary: Record<string, number>;
   try {
@@ -69,6 +85,24 @@ async function main(): Promise<void> {
     // 4. warm cache — must not touch the DB at all
     db.count = 0;
     for (let i = 0; i < WARM_READS; i++) await getCard(i, ids[i % ids.length]);
+    const dbCallsWarm = db.count;
+
+    // 5. slow DB, nothing to serve
+    await admin.del(productCardKey(ids[1]));
+    db.count = 0;
+    const slow = await Promise.allSettled(Array.from({ length: CONCURRENT }, (_, i) => getCardSlowDb(i, ids[1])));
+    const slowDbCalls = db.count;
+    const slowBusy = slow.filter((r) => r.status === 'rejected' && r.reason instanceof CacheBusyError).length;
+    const slowServed = slow.filter((r) => r.status === 'fulfilled').length;
+
+    // 6. slow DB, stale copy available
+    await caches[0].markStale(productCardKey(ids[2]));
+    await pool.query(`UPDATE products SET name = name || ' (v2)' WHERE id = $1`, [ids[2]]);
+    db.count = 0;
+    const swr = await Promise.all(Array.from({ length: CONCURRENT }, (_, i) => getCardSlowDb(i, ids[2])));
+    const staleDbCalls = db.count;
+    const staleServed = swr.filter((c) => c && !c.name.endsWith('(v2)')).length;
+    const freshAfter = (await getCard(0, ids[2]))?.name.endsWith('(v2)') ? 1 : 0;
 
     summary = {
       'cache-lru': cacheLru,
@@ -78,8 +112,14 @@ async function main(): Promise<void> {
       concurrent: CONCURRENT,
       pods: PODS,
       'db-calls': dbCalls,
-      'db-calls-warm': db.count,
+      'db-calls-warm': dbCallsWarm,
       'results-consistent': consistent,
+      'slow-db-calls': slowDbCalls,
+      'slow-served': slowServed,
+      'slow-busy': slowBusy,
+      'stale-db-calls': staleDbCalls,
+      'stale-served': staleServed,
+      'stale-refreshed': freshAfter,
     };
   } finally {
     await admin.del(...ids.map(productCardKey), ...ids.map((id) => `lock:${productCardKey(id)}`)).catch(() => {});
@@ -93,6 +133,10 @@ async function main(): Promise<void> {
     'warmed >= 50 with jittered TTLs': summary.warmed >= 50 && summary['ttl-distinct'] >= 5,
     'stampede -> exactly one DB call': summary['db-calls'] === 1 && summary['results-consistent'] === 1,
     'warm reads -> zero DB calls': summary['db-calls-warm'] === 0,
+    'slow DB: one call, the rest shed (not loaded)':
+      NO_LOCK || (summary['slow-db-calls'] === 1 && summary['slow-busy'] + summary['slow-served'] === CONCURRENT),
+    'stale copy served while one caller refreshes':
+      NO_LOCK || (summary['stale-db-calls'] === 1 && summary['stale-served'] > 0 && summary['stale-refreshed'] === 1),
   });
 }
 

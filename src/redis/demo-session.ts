@@ -51,6 +51,10 @@ async function startPod(): Promise<Pod> {
       next(err);
     }
   });
+  // stand-in for app.js's problem+json filter
+  app.use((err: Error & { status?: number }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    res.status(err.status ?? 500).json({ status: err.status ?? 500, detail: err.message });
+  });
   const server = await new Promise<Server>((resolve) => {
     const s = app.listen(0, '127.0.0.1', () => resolve(s));
   });

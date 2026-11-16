@@ -13,7 +13,14 @@ function httpError(status: number, message: string): Error & { status: number } 
  * body shape) and demo:outbox (which mounts it bare, so the demo's two
  * requests go through exactly this code, not a copy of it).
  */
-export function createCheckoutHandler(service: CheckoutService): RequestHandler {
+export interface CheckoutHandlerOptions {
+  /** HW #23: runs after a committed (or replayed) order — app.js marks the
+   *  product's cached card stale, since its stock just changed. A failure
+   *  here never fails the checkout: the order is already committed. */
+  onPlaced?: (productId: string) => Promise<void> | void;
+}
+
+export function createCheckoutHandler(service: CheckoutService, opts: CheckoutHandlerOptions = {}): RequestHandler {
   return async (req, res, next) => {
     try {
       const idempotencyKey = req.header('idempotency-key');
@@ -25,6 +32,7 @@ export function createCheckoutHandler(service: CheckoutService): RequestHandler 
       // the same thing and gets the same answer), flagged the same way
       // POST /orders (HW #9) already flags its own replays.
       if (result.replayed) res.set('Idempotency-Replay', 'true');
+      await Promise.resolve(opts.onPlaced?.(String(product_id))).catch(() => {});
       res.status(201).json({ order_id: result.orderId, total_cents: result.totalCents });
     } catch (err) {
       if (err instanceof InsufficientStockError || err instanceof InsufficientBalanceError) {

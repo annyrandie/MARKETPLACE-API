@@ -42,7 +42,8 @@ on top — on **two** instances, because a cache and a queue need opposite
 eviction policies: cache-aside with jittered TTLs and a single-flight
 lock (25 concurrent misses → 1 DB query), sessions with a rolling TTL, a
 rate limit shared by two pods, and a BullMQ queue with retries, jobId
-dedup and a job scheduler. See
+dedup and a job scheduler. The cache, the limiter and the sessions are
+wired into the app's own routes and OpenAPI contract. See
 [Redis](#redis-кеш-сесії-ліміти-черга-hw-23) below.
 
 ## Quickstart for the grader
@@ -140,13 +141,16 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `src/outbox/demo-outbox.ts` / `demo-crash-write.ts` / `demo-crash-relay.ts` / `demo-kit.ts` | `npm run demo:outbox` / `demo:crash-write` / `demo:crash-relay` + their shared cleanup/counting |
 | `docker-compose.yml` → `redis-cache` / `redis-queue` | HW #23: two Redis boxes — `allkeys-lru` + `maxmemory 64mb` vs `noeviction` + AOF `everysec` |
 | `src/redis/connections.ts` | `createCacheRedis()` / `createStateRedis()` / `createWorkerRedis()` (`maxRetriesPerRequest: null`) + runtime `CONFIG GET` |
-| `src/redis/cache.ts` | `CacheAside` — jittered TTL, `SET NX PX` single-flight lock, Lua compare-and-delete release, every Redis error degrades to the DB |
+| `src/redis/cache.ts` | `CacheAside` — jittered TTL, stale-while-revalidate, in-process + `SET NX PX` single-flight, Lua compare-and-delete release, `CacheBusyError` instead of a DB fallback |
 | `src/repositories/product-card.repository.ts` | the heavy read (product + sales aggregates) + `CountingQueryable`, which counts statements actually sent to Postgres |
 | `src/redis/session.ts` | Redis session store (`GETEX … EX` rolling TTL, hashed token, absolute cap) + express middleware |
 | `src/redis/rate-limit.ts` | sliding-window limiter as one Lua script on Redis `TIME`, 429 + `Retry-After` |
 | `src/redis/order-email.queue.ts` | BullMQ `order-email` queue: attempts/backoff/jitter, jobId from the event id, `upsertJobScheduler` |
 | `src/redis/queue-worker.ts` | the worker as its own process (`npm run queue:worker`); refuses to start on a non-`noeviction` box |
 | `src/redis/demo-cache.ts` / `demo-session.ts` / `demo-ratelimit.ts` / `demo-queue.ts` | `npm run demo:cache` / `demo:session` / `demo:ratelimit` / `demo:queue` |
+| `src/redis/ratelimit-pod.ts` | one rate-limited "pod" as its own process — `demo:ratelimit` forks two |
+| `src/http/product-card.handler.ts` / `src/http/session.handlers.ts` | `GET /product-cards/{id}` (503 on `CacheBusyError`) / `POST /sessions`, `GET`/`DELETE /sessions/current` |
+| `test/e2e/redis.e2e.test.js` | the Redis routes in the real app, against real Postgres + two Redis containers |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -194,7 +198,9 @@ touches `process.env` directly.
 | `DB_URL` | **yes** | — | **secret store** — `.env` locally (HW #11), a secrets manager in prod; `.env.example` only holds the fake local-dev shape | Postgres connection string, **without** a password (`postgres://app_user@127.0.0.1:5433/marketplace`) |
 | `DB_PASSWORD_FILE` | no | `secrets/db_password` | `.env.example` | path to the file holding the current DB password |
 | `LOG_LEVEL` | no | `info` | `.env.example` | `debug` \| `info` \| `warn` \| `error` |
-| `TIMEOUT_MS` | no | `5000` | `.env.example` | Postgres connection timeout, ms |
+| `TIMEOUT_MS` | no | `5000` | `.env.example` | Postgres and Redis connection timeout, ms |
+| `REDIS_URL` | no | `redis://127.0.0.1:6379` | `.env.example`; with auth → the vault (`secrets/redis_url`) | the cache Redis (`allkeys-lru`) — HW #23 |
+| `REDIS_QUEUE_URL` | no | `redis://127.0.0.1:6380` | `.env.example`; with auth → the vault (`secrets/redis_queue_url`) | the state Redis (`noeviction`): sessions, rate limits, BullMQ — HW #23 |
 
 The DB password is deliberately **not** one of these variables — see
 [Secrets](#secrets) below for why.
@@ -235,7 +241,7 @@ moment they drift apart:
 
 ```bash
 npm run check:env
-# ✓ .env.example is in sync with the schema (5 variables)
+# ✓ .env.example is in sync with the schema (7 variables)
 ```
 
 ### Secrets
@@ -1504,23 +1510,31 @@ It's a join and a `GROUP BY` that grow with order history, while the
 answer changes rarely. On a miss the code reads Postgres and writes
 `product-card:v1:<id>`. On a hit only Redis is touched. Details:
 
-- **TTL is always set**: `300 + randomInt(0..60)` s, a 60 s spread.
-  Without jitter, the 60 keys warmed by one loop expire in the same second
-  and cause a stampede of their own. `invalidate()` exists for writes, as
-  an addition to the TTL, never a replacement for it.
+- **Fresh for `300 + randomInt(0..60)` s**, a 60 s spread. Without
+  jitter, the 60 keys warmed by one loop expire in the same second and
+  cause a stampede of their own.
+- **Then stale for another 120 s.** The value carries its own "fresh
+  until" timestamp (`{"v": …, "f": <epoch ms>}`), and the Redis TTL is
+  always set to fresh + stale, so nothing lives forever. A stale value is
+  still served while one caller refreshes it (see below).
+- **Writes invalidate softly.** `POST /checkout` changes a product's stock,
+  so the handler calls `markStale()` on its card. That marks the card
+  stale instead of deleting it: the next reader refreshes it and
+  concurrent readers get the old copy. A `DEL` would make every concurrent
+  reader wait or fail. This is in addition to the TTL, never instead of it.
 - **Redis is never on the failure path.** A failed `GET` counts as a miss,
   a failed `SET` (e.g. `OOM command not allowed` on a misconfigured box)
   is logged and the user still gets the answer, and if the lock can't be
   taken the request just loads. A cache that fails requests isn't a cache.
-- Values are wrapped in `{"v": …}`, so a cached "not found" (`null`) is a
-  hit and not a miss forever.
+- A cached "not found" (`null`) is a hit, with a short 30 s TTL, so a
+  product created a minute later doesn't stay 404 for five minutes.
 
 ### 2. Single-flight lock against a stampede
 
 On a miss:
 
-1. The request runs `SET lock:<key> <uuid> NX PX 3000`, and exactly one
-   caller wins.
+1. The request runs `SET lock:<key> <uuid> NX PX 5000`, and exactly one
+   caller wins. The 5 s must comfortably exceed the slowest load.
 2. The winner re-reads the cache, because the previous holder may have
    just filled it.
 3. The winner loads from Postgres and writes the value with its jittered
@@ -1528,11 +1542,29 @@ On a miss:
 4. The winner releases the lock with a compare-and-delete in Lua:
    `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end`.
 
-The losers poll the cache every 25 ms. If the lock disappears without a
-value (the winner died), one of the losers takes it over. A bare `DEL`
-would be wrong: if our lock expired while we were loading, someone else
-now holds it, and `DEL` would release *their* lock. Lua is used rather than
-`DELEX … IFEQ`, so the code doesn't silently depend on Redis 8.4+.
+A bare `DEL` would be wrong: if our lock expired while we were loading,
+someone else now holds it, and `DEL` would release *their* lock. Lua is
+used rather than `DELEX … IFEQ`, so the code doesn't silently depend on
+Redis 8.4+.
+
+What the losers do depends on what's in the cache:
+
+- **A stale copy exists** → they return it immediately and don't wait
+  (stale-while-revalidate).
+- **Nothing to serve** → they poll the cache every 25 ms for up to
+  `waitTimeoutMs` (1 s). If the lock disappears without a value (the
+  winner died, or its load failed), one of them takes it over. If time
+  runs out, they throw `CacheBusyError`, and the API answers **503 +
+  `Retry-After`**. They **do not** fall through to the database. The
+  first version did exactly that after 2 × the lock TTL, and on a slow
+  database that brought the whole stampede back at once. `waitTimeoutMs`
+  is deliberately shorter than the lock TTL: giving up must never mean
+  "load anyway".
+
+There is also a second layer of single-flight in front of the Redis one.
+Concurrent callers **in the same process** share one promise per key.
+So even when Redis is unreachable and nobody can take the lock, each
+pod sends at most one query per key, not one per request.
 
 `db-calls` is counted **per SQL statement sent to Postgres**, by the
 `CountingQueryable` wrapper around the pool, not per call of `findCard()`.
@@ -1543,12 +1575,18 @@ npm run demo:cache
 # cache-lru=1
 # cache-maxmemory=1            # 67108864 bytes
 # warmed=60
-# ttl-distinct=39              # TTL range 300..358 s; varies per run, always well above 5
+# ttl-distinct=39              # Redis TTL range 422..480 s (fresh 300..360 + 120 stale); varies per run
 # concurrent=25                # through 5 separate Redis connections ("pods")
 # pods=5
 # db-calls=1
 # db-calls-warm=0              # 100 more reads of the warm cache
 # results-consistent=1         # all 25 got the identical card
+# slow-db-calls=1              # same stampede, but the DB takes 1 s and callers wait at most 300 ms:
+# slow-served=5                #   the winner pod's 5 callers get the value,
+# slow-busy=20                 #   the other 20 get CacheBusyError (→ 503), none of them query the DB
+# stale-db-calls=1             # slow DB again, but the key is stale (markStale) and the product renamed:
+# stale-served=24              #   24 callers get the old copy at once, without waiting,
+# stale-refreshed=1            #   one reloads, and the next read sees the new name
 
 node dist/redis/demo-cache.js --no-lock   # control run: same stampede, no single-flight
 # db-calls=25
@@ -1558,7 +1596,7 @@ node dist/redis/demo-cache.js --no-lock   # control run: same stampede, no singl
 ### What happens if the stampede lock breaks, and why that's fine here
 
 A Redis lock can break in two ways. The winner can pause longer than
-`PX 3000` (GC, page fault, container move), so the lock expires and a
+`PX 5000` (GC, page fault, container move), so the lock expires and a
 second caller takes it while the first one is still loading. Or Redis can
 fail over to a replica that never saw the `SET NX`. Either way, two
 callers believe they hold the lock. **Here the consequence is one extra
@@ -1630,9 +1668,17 @@ at once.
   error is logged. This limiter protects capacity and is not a security
   boundary, so Redis being down shouldn't take the API down too.
 
+**Each pod is a separate OS process.** `demo:ratelimit` starts both with
+`child_process.fork` (`src/redis/ratelimit-pod.ts`), and each one has its
+own HTTP server, Redis connection and limiter. The first version ran both
+pods in one process. That couldn't tell a Redis counter from a module-level
+`Map`, because both would give `allowed=5`. Now the difference is
+visible, and there's a control run that proves it:
+
 ```bash
 npm run demo:ratelimit
-# instances=2                  # two HTTP servers, each with its OWN Redis connection + limiter
+# instances=2
+# processes=2                  # two child PIDs, neither of them the demo's own
 # limit=5
 # requests=12                  # alternating pod-0, pod-1, …
 # allowed=5                    # 3 + 2 — both pods served, the sum is still 5, not 10
@@ -1641,6 +1687,11 @@ npm run demo:ratelimit
 # retry-after=1                # Retry-After: 10
 # pods-served=2
 # burst-allowed=5              # same 12 fired all at once: still 5, so the Lua script really is atomic
+
+node dist/redis/demo-ratelimit.js --in-memory   # control: the same pods, counting in a Map
+# allowed=10                   # 5 + 5 — each process has its own Map
+# burst-allowed=10
+# ✗ invariant violated: shared limit across pods, atomic under a concurrent burst
 ```
 
 ### 5. A BullMQ queue: retries, jobId dedup, a scheduler
@@ -1678,6 +1729,51 @@ npm run demo:queue
 # scheduled-runs=3             # every 500 ms, observed ~1.1 s
 ```
 
+### In the app: routes, contract, tests
+
+The cache, the limiter and the sessions are wired into `app.js` and
+documented in `openapi/openapi.yaml`. The OpenAPI request **and response**
+validator covers them like every other route.
+
+| Route | What Redis does | New responses |
+|---|---|---|
+| `GET /product-cards/{productId}` | cache-aside + single-flight + stale-while-revalidate; limit 60/min per IP | `429` + `Retry-After`, `503` + `Retry-After` (`CacheBusyError`) |
+| `POST /sessions` `{email}` | creates `sess:<sha256>`, sets the `sid` cookie; limit 10/min per IP | `401` (unknown e-mail is the same 401 as any other failure), `429` |
+| `GET /sessions/current` | `GETEX` → rolls the idle TTL | `401` |
+| `DELETE /sessions/current` | deletes the session, clears the cookie | `204`, `401` |
+| `POST /checkout` | after commit, `markStale()` on the product's card | — |
+
+- **Login is by e-mail only.** The schema has no passwords yet, and
+  HW #24 adds real authentication on top of this same session. Until
+  then, the endpoint is rate-limited and doesn't reveal which e-mails
+  exist.
+- The 429 and 401 go through `next(err)` into the same problem+json filter
+  as every other error, never a hand-written body. That keeps the
+  response validator seeing the full `Problem` shape. The 503 is marked
+  `expose` so the filter keeps its message instead of turning it into
+  "Internal server error".
+- In the spec, `security: [sessionCookie]` documents which operations need
+  a session. Enforcement is `requireSession`, which checks both presence
+  **and** validity in Redis. The validator's own check
+  (`validateSecurity`) is off: it only tests that a cookie is present, and
+  it reads `req.cookies`, which needs `cookie-parser`.
+- `REDIS_URL` / `REDIS_QUEUE_URL` are part of the app's own zod config
+  now, and appear in `.env.example` (`npm run check:env` → 7 variables).
+  The connections are lazy (`lazyConnect`), so `app.e2e.test.js` and the
+  Pact provider, which never call these routes, still need only Postgres.
+- `test/e2e/redis.e2e.test.js` tests all of the above against a real
+  Postgres plus **two** Redis containers (`allkeys-lru` / `noeviction`):
+  - the card comes from the DB, then from the cache (a row changed behind
+    its back isn't visible), and an unknown id gives 404;
+  - after checkout, the card shows the new stock;
+  - login → current → logout → 401, with a forged cookie also giving 401;
+  - the 11th login attempt gives 429 + `Retry-After`.
+
+```bash
+npm run test:e2e
+# Tests: 11 passed, 11 total      (redis.e2e 4 + checkout.e2e 5 + app.e2e 2)
+```
+
 ### Secrets, cleanup, what's not done
 
 - `REDIS_URL` and `REDIS_QUEUE_URL` come through `scripts/with-secrets.sh`,
@@ -1691,11 +1787,10 @@ npm run demo:queue
   `demo:ratelimit` use per-run ids and delete them. `demo:queue` runs
   under its own `bull-demo` key prefix and `obliterate`s it before and
   after. After a full run, `DBSIZE` is 0 on both boxes.
-- The middlewares, the cache and the queue are **not wired into `app.js`
-  routes yet**. That would change HW #9's OpenAPI contract (new 401/429
-  responses, a card endpoint), so it's left as a separate step. The demos
-  run the real modules on throwaway express servers, the same way
-  `demo:outbox` runs the real checkout handler.
+- **The queue isn't fed from `app.js` yet.** `POST /checkout` doesn't
+  enqueue the confirmation email. The natural producer is the outbox
+  consumer side (HW #22), with the jobId taken from the `eventId` it
+  already carries. `npm run queue:worker` processes the queue on its own.
 
 ## Verification (acceptance criteria)
 
@@ -1715,8 +1810,9 @@ const ops=Object.entries(s.paths).flatMap(([p,v])=>Object.keys(v).filter(m=>M.in
 const idem=ops.flatMap(([p,m])=>s.paths[p][m].parameters??[]).find(x=>x.in==='header'&&/idempotency-key/i.test(x.name));\
 console.log('operations:',ops.length,'· resources:',new Set(Object.keys(s.paths).map(p=>p.split('/')[1])).size);\
 console.log('Idempotency-Key: required =',idem?.required,'· description length =',(idem?.description??'').trim().length)"
-# expected: operations: 9 · resources: 3 · required = true · description length = 393
-# (HW #9 shipped 6 · 2; HW #18 added PATCH …/status + GET …/events, HW #19 POST /checkout.
+# expected: operations: 13 · resources: 5 · required = true · description length = 393
+# (HW #9 shipped 6 · 2; HW #18 added PATCH …/status + GET …/events, HW #19 POST /checkout,
+#  HW #23 GET /product-cards/{id} + POST /sessions + GET/DELETE /sessions/current.
 #  The first Idempotency-Key found is still POST /orders' — hence the same 393)
 ```
 

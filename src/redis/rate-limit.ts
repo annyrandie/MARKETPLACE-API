@@ -87,11 +87,10 @@ export class RedisRateLimiter {
       res.setHeader('RateLimit-Remaining', String(decision.remaining));
       if (decision.allowed) return next();
       res.setHeader('Retry-After', String(Math.max(1, Math.ceil(decision.retryAfterMs / 1000))));
-      res.status(429).type('application/problem+json').json({
-        title: 'Too Many Requests',
-        status: 429,
-        detail: `limit ${this.opts.limit} per ${this.opts.windowMs / 1000}s`,
-      });
+      // An error, not a hand-written body: app.js's problem+json filter
+      // renders it like every other error (and the response validator
+      // sees the full Problem shape).
+      next(Object.assign(new Error(`limit ${this.opts.limit} per ${this.opts.windowMs / 1000}s`), { status: 429 }));
     };
   }
 }

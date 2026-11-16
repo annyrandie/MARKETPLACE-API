@@ -25,6 +25,11 @@ export class CheckoutService {
     return checkout(ds, userId, productId, quantity, { idempotencyKey });
   }
 
+  /** Graceful shutdown / test teardown: close the pool if it was opened. */
+  async close(): Promise<void> {
+    if (this.ds.isInitialized) await this.ds.destroy();
+  }
+
   private dataSource(): Promise<DataSource> {
     if (!this.dsReady) {
       this.dsReady = (this.ds.isInitialized ? Promise.resolve(this.ds) : this.ds.initialize()).catch((err) => {

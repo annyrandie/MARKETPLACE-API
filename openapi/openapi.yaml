@@ -6,14 +6,16 @@ info:
   description: >
     Marketplace API contract — the source of truth for the DB schema (HW #12),
     entities (HW #13), the transactional order-checkout logic (HW #14), and
-    the contract/E2E suite (HW #16). Seven honest operations that are actually
-    implemented in variant B (`app.js`), not declared just in case.
+    the contract/E2E suite (HW #16). Every operation here is actually
+    implemented in `app.js`, not declared just in case.
 
 servers:
   - url: http://localhost:3000
     description: Local app running variant B
 
-# No authorization in the API yet — deliberately, not an oversight.
+# No authorization by default — deliberately, not an oversight. HW #23 adds
+# a Redis session (cookie `sid`), required only by the operations that
+# declare `security: [sessionCookie: []]` below; HW #24 adds real auth.
 security: []
 
 tags:
@@ -21,6 +23,8 @@ tags:
     description: Product catalog
   - name: orders
     description: Placing and viewing orders
+  - name: sessions
+    description: Redis-backed sessions with a rolling idle timeout (HW #23)
 
 paths:
   /products:
@@ -317,7 +321,135 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
 
+  /product-cards/{productId}:
+    get:
+      operationId: getProductCard
+      tags: [products]
+      summary: >
+        A product card from Postgres (products.id, unlike `/products`, which
+        is HW #9's in-memory variant B): price, live stock and sales
+        aggregates. Served through a Redis cache-aside with a jittered TTL
+        and a single-flight lock — on a miss, one request per key reads the
+        database (HW #23). The stock shown is informational and may lag a
+        few minutes; checkout re-checks it atomically.
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9]+$'
+          description: products.id (bigint, as a string)
+      responses:
+        '200':
+          description: The product card
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimitLimit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimitRemaining'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductCard'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /sessions:
+    post:
+      operationId: createSession
+      tags: [sessions]
+      summary: >
+        Log in: creates a session in Redis and sets the `sid` cookie
+        (HttpOnly, SameSite=Lax). Identity only, by e-mail — there are no
+        passwords in this schema yet (HW #24 adds real authentication).
+        Rate-limited per client; an unknown e-mail is the same 401 as any
+        other failure, so this doesn't reveal which addresses exist.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewSession'
+      responses:
+        '201':
+          description: Session created; the token is only in the `Set-Cookie` header, never in the body
+          headers:
+            Set-Cookie:
+              description: '`sid=<opaque token>; HttpOnly; SameSite=Lax; Path=/`'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /sessions/current:
+    get:
+      operationId: getCurrentSession
+      tags: [sessions]
+      summary: >
+        The caller's session. Every request carrying a valid `sid` renews
+        the session's idle timeout (rolling TTL); it still ends at an
+        absolute cap counted from login.
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: The current session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    delete:
+      operationId: deleteCurrentSession
+      tags: [sessions]
+      summary: Log out — the session is deleted from Redis and the cookie cleared.
+      security:
+        - sessionCookie: []
+      responses:
+        '204':
+          description: Logged out
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
 components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: sid
+      description: Opaque session token set by `POST /sessions`; Redis stores only its SHA-256.
+
+  headers:
+    RateLimitLimit:
+      description: Requests allowed per window for this client
+      schema:
+        type: integer
+    RateLimitRemaining:
+      description: Requests left in the current window
+      schema:
+        type: integer
+    RetryAfter:
+      description: Seconds to wait before retrying
+      schema:
+        type: integer
+        minimum: 1
+
   parameters:
     Limit:
       name: limit
@@ -359,6 +491,42 @@ components:
       description: Order identifier.
 
   responses:
+    Unauthorized:
+      description: No valid session (missing, expired, or logged out) — or, for login, invalid credentials
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    TooManyRequests:
+      description: >
+        Rate limit exceeded. The limit is shared by every instance of the
+        service (a sliding window in Redis), not counted per process.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimitLimit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimitRemaining'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+    ServiceUnavailable:
+      description: >
+        The cache entry is being rebuilt by another request and there is no
+        stale copy to serve yet — load is shed instead of sent to the
+        database. Retry after `Retry-After` seconds.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
     BadRequest:
       description: Request does not conform to the contract (parameter or body validation)
       content:
@@ -381,6 +549,49 @@ components:
             $ref: '#/components/schemas/Problem'
 
   schemas:
+    ProductCard:
+      type: object
+      additionalProperties: false
+      required: [id, name, price_cents, stock, units_sold, orders_count]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        price_cents:
+          type: integer
+        stock:
+          type: integer
+          description: Informational, may lag by up to the cache TTL
+        units_sold:
+          type: integer
+        orders_count:
+          type: integer
+
+    NewSession:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+
+    Session:
+      type: object
+      additionalProperties: false
+      required: [user_id, idle_timeout_seconds]
+      properties:
+        user_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        idle_timeout_seconds:
+          type: integer
+          description: The session expires after this much inactivity; each request resets it
+
     CheckoutRequest:
       type: object
       additionalProperties: false
