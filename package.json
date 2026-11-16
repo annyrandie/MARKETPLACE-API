@@ -1,7 +1,7 @@
 {
   "name": "marketplace-api",
   "version": "1.0.0",
-  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16) + realtime WebSocket/SSE (HW #18) + async events over RabbitMQ (HW #19) + transactional outbox, relay, idempotent consumer (HW #22)",
+  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16) + realtime WebSocket/SSE (HW #18) + async events over RabbitMQ (HW #19) + transactional outbox, relay, idempotent consumer (HW #22) + Redis: cache-aside/single-flight, sessions, shared rate limit, BullMQ queue (HW #23)",
   "main": "app.js",
   "scripts": {
     "start": "npm run build --silent && node app.js",
@@ -38,16 +38,23 @@
     "demo:crash-write": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/demo-crash-write.js",
     "demo:crash-relay": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/demo-crash-relay.js",
     "outbox:relay": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/relay-worker.js",
-    "outbox:consumer": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/invoicing-worker.js"
+    "outbox:consumer": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/outbox/invoicing-worker.js",
+    "demo:cache": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/demo-cache.js",
+    "demo:session": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/demo-session.js",
+    "demo:ratelimit": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/demo-ratelimit.js",
+    "demo:queue": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/demo-queue.js",
+    "queue:worker": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/queue-worker.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "amqplib": "^2.2.0",
+    "bullmq": "^6.7.5",
     "dotenv": "^17.4.2",
     "express": "^4.22.2",
     "express-openapi-validator": "^5.6.2",
+    "ioredis": "^5.11.1",
     "pg": "^8.22.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",

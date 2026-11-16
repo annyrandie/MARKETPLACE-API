@@ -120,5 +120,63 @@ services:
       timeout: 5s
       retries: 30
 
+  # Redis (HW #23) — TWO instances, not one with SELECT 1: maxmemory and
+  # maxmemory-policy are per-process settings, and a cache and a queue need
+  # opposite ones. Bound to 127.0.0.1 only: no auth on these dev boxes, so
+  # they must not be reachable from the LAN.
+  #
+  # redis-cache: a cache MUST be allowed to forget. Capped memory +
+  # allkeys-lru means "full" quietly evicts the coldest keys instead of
+  # failing writes (the stock config is maxmemory 0 + noeviction, i.e. a
+  # cache that one day starts throwing OOM at every SET). No persistence —
+  # a cache restarted empty is still a correct cache, just a cold one.
+  redis-cache:
+    image: redis:8.4-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ''
+      - --appendonly
+      - 'no'
+    ports:
+      - '127.0.0.1:${REDIS_CACHE_HOST_PORT:-6379}:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # redis-queue: BullMQ state + sessions + rate-limit counters — data that
+  # must NOT silently disappear. noeviction (BullMQ's docs: it "cannot work
+  # properly if Redis evicts keys arbitrarily"); when full, writes fail
+  # loudly instead of a random job/session vanishing. AOF everysec: a
+  # restart loses at most ~1s of writes, not the whole queue.
+  redis-queue:
+    image: redis:8.4-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - 'yes'
+      - --appendfsync
+      - everysec
+    ports:
+      - '127.0.0.1:${REDIS_QUEUE_HOST_PORT:-6380}:6379'
+    volumes:
+      - redis-queue-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
 volumes:
   pgdata-restore:
+  redis-queue-data:

@@ -16,6 +16,13 @@ const { DataSource } = require('typeorm');
 const AppDataSource = require('./dist/data-source').default;
 const { CheckoutService } = require('./dist/checkout.service');
 const { createCheckoutHandler } = require('./dist/http/checkout.handler');
+const { createCacheRedis, createStateRedis } = require('./dist/redis/connections');
+const { CacheAside } = require('./dist/redis/cache');
+const { RedisRateLimiter } = require('./dist/redis/rate-limit');
+const { RedisSessionStore, sessionMiddleware, requireSession } = require('./dist/redis/session');
+const { ProductCardRepository, productCardKey } = require('./dist/repositories/product-card.repository');
+const { createProductCardHandler } = require('./dist/http/product-card.handler');
+const { createSessionHandlers } = require('./dist/http/session.handlers');
 
 // Fail-fast: either the process starts with a fully valid config, or it
 // doesn't start at all — and says in plain language which variable is
@@ -98,6 +105,52 @@ const checkoutService = new CheckoutService(
     extra: { max: 5 },
   }),
 );
+
+// HW #23: the two Redis boxes, from the validated config (REDIS_URL /
+// REDIS_QUEUE_URL). lazyConnect: nothing connects until a route that
+// needs Redis is hit — app.e2e.test.js and the Pact provider, which never
+// call those routes, keep needing only Postgres. Fail fast either way
+// (connectTimeout = TIMEOUT_MS): a request mustn't hang on a dead Redis.
+const redisOpts = { lazyConnect: true, connectTimeout: env.TIMEOUT_MS };
+const cacheRedis = createCacheRedis(redisOpts, env.REDIS_URL);
+const stateRedis = createStateRedis(redisOpts, env.REDIS_QUEUE_URL);
+for (const [name, client] of [['cache', cacheRedis], ['state', stateRedis]]) {
+  // without a listener ioredis prints "Unhandled error event" on every
+  // reconnect attempt; the cache and limiter already degrade on their own
+  client.on('error', (err) => log('warn', `[redis ${name}] ${err.message}`));
+}
+
+const cardCache = new CacheAside(cacheRedis);
+const cardRepo = new ProductCardRepository(pool);
+const sessionStore = new RedisSessionStore(stateRedis);
+const sessionHandlers = createSessionHandlers(sessionStore, pool);
+const withSession = sessionMiddleware(sessionStore);
+
+// Per-IP sliding windows on the state box, shared by every instance of
+// this app. Login is the tight one: it's the brute-force/enumeration
+// surface (and has no password yet — see session.handlers.ts).
+const cardLimiter = new RedisRateLimiter(stateRedis, {
+  limit: 60,
+  windowMs: 60_000,
+  prefix: 'product-cards',
+  clientId: (req) => req.ip,
+});
+const loginLimiter = new RedisRateLimiter(stateRedis, {
+  limit: 10,
+  windowMs: 60_000,
+  prefix: 'login',
+  clientId: (req) => req.ip,
+});
+
+
+/** For tests/graceful shutdown: close what this module opened — Redis
+ *  connections (a no-op for ones that never connected), checkout's
+ *  DataSource, the pg pool. */
+async function closeResources() {
+  await Promise.all([cacheRedis, stateRedis].map((c) => (c.status === 'wait' ? c.disconnect() : c.quit().catch(() => {}))));
+  await checkoutService.close();
+  await pool.end();
+}
 
 function getOwnedOrder(orderId) {
   const order = orders.get(orderId);
@@ -239,6 +292,11 @@ function createApp() {
       apiSpec: SPEC_PATH,
       validateRequests: true,
       validateResponses: true,
+      // HW #23: `security: sessionCookie` in the spec documents which
+      // operations need a session; requireSession enforces it (presence
+      // AND validity in Redis). The validator's own check would only test
+      // presence, and reads req.cookies — which needs cookie-parser.
+      validateSecurity: false,
     }),
   );
 
@@ -324,7 +382,21 @@ function createApp() {
     }
   });
 
-  app.post('/checkout', createCheckoutHandler(checkoutService));
+  // HW #23: a placed order changes the product's stock → its cached card
+  // goes stale (served once more while one request refreshes it).
+  app.post(
+    '/checkout',
+    createCheckoutHandler(checkoutService, { onPlaced: (productId) => cardCache.markStale(productCardKey(productId)) }),
+  );
+
+  // HW #23: the heavy read behind cache-aside + single-flight, rate-limited.
+  app.get('/product-cards/:productId', cardLimiter.middleware(), createProductCardHandler(cardCache, cardRepo));
+
+  // HW #23: Redis sessions with a rolling TTL (sessionMiddleware renews it
+  // on every request that carries the cookie).
+  app.post('/sessions', loginLimiter.middleware(), sessionHandlers.login);
+  app.get('/sessions/current', withSession, requireSession, sessionHandlers.current);
+  app.delete('/sessions/current', withSession, requireSession, sessionHandlers.logout);
 
   app.get('/orders/:orderId', (req, res, next) => {
     const order = orders.get(req.params.orderId);
@@ -357,7 +429,9 @@ function createApp() {
     // express-openapi-validator already formats err.message as
     // "request/headers must have required property '…'" — that's what goes in detail.
     let detail = err.message || 'Unexpected error';
-    if (status >= 500) {
+    // `expose`: a 5xx whose message is meant for the client (503 "cache
+    // entry is being rebuilt, retry later") — not an unexpected crash.
+    if (status >= 500 && !err.expose) {
       console.error('[error-filter] unhandled error:', err); // details go to the log only
       detail = 'Internal server error';
     }
@@ -388,7 +462,7 @@ function createHttpServer() {
   return server;
 }
 
-module.exports = { createApp, createHttpServer };
+module.exports = { createApp, createHttpServer, closeResources };
 
 if (require.main === module) {
   createHttpServer().listen(env.PORT, () => {

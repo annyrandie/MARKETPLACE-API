@@ -79,4 +79,16 @@ PACT_BROKER_TOKEN="$([ -f "$ROOT/secrets/pact_broker_token" ] && cat "$ROOT/secr
 export BROKER_URL
 BROKER_URL="$([ -f "$ROOT/secrets/broker_url" ] && cat "$ROOT/secrets/broker_url" || echo "${BROKER_URL:-amqp://app:app@127.0.0.1:5672}")"
 
+# HW #23: the two Redis instances, same vault, same convention as
+# BROKER_URL. REDIS_URL = the cache box (allkeys-lru, may forget);
+# REDIS_QUEUE_URL = the queue box (noeviction, AOF) that also holds
+# sessions and rate-limit counters. Defaults match docker-compose.yml's
+# redis-cache / redis-queue (no auth, bound to 127.0.0.1); a real
+# deployment puts rediss://user:pass@… into secrets/redis_url and
+# secrets/redis_queue_url — gitignored, never in .env.
+export REDIS_URL
+REDIS_URL="$([ -f "$ROOT/secrets/redis_url" ] && cat "$ROOT/secrets/redis_url" || echo "${REDIS_URL:-redis://127.0.0.1:6379}")"
+export REDIS_QUEUE_URL
+REDIS_QUEUE_URL="$([ -f "$ROOT/secrets/redis_queue_url" ] && cat "$ROOT/secrets/redis_queue_url" || echo "${REDIS_QUEUE_URL:-redis://127.0.0.1:6380}")"
+
 exec "$@"
