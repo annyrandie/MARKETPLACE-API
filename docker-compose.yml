@@ -177,6 +177,43 @@ services:
       timeout: 2s
       retries: 15
 
+  # S3-compatible object storage (HW #26). RustFS, not MinIO: minio/minio
+  # and minio/mc were DELETED from Docker Hub on 2026-09-11 — a pinned tag
+  # doesn't help when the repository itself is gone, a clean clone just
+  # can't pull it. RustFS was chosen over the other live options after a
+  # behaviour probe (see README, Files): it answers like AWS where it
+  # matters — 403 for an expired AND for a tampered presigned URL, 403 for
+  # anonymous reads, and it REJECTS a 1 KiB part mid-multipart
+  # (EntityTooSmall), where a lenient store would "work" and prod would
+  # fail. Garage answers 400 to an expired URL and accepts tiny parts;
+  # LocalStack no longer starts without an account auth token.
+  #
+  # Pinned to a version, not :latest. Dev credentials below are not a
+  # secret (same class as admin-bootstrap-only above) — the app and the
+  # demos still read them from the vault (scripts/with-secrets.sh), so a
+  # real deployment only swaps the vault entries.
+  #
+  # Data in tmpfs, 1 GiB: every `down` leaves a clean slate, and the
+  # 12 MiB multipart demo × repeated runs has room (256m dies mid-series).
+  # mode=1777: the image runs as a non-root user and can't write a
+  # root-owned tmpfs otherwise ("Permission denied (os error 13)").
+  # 127.0.0.1 only: dev credentials, so not reachable from the LAN.
+  storage:
+    image: rustfs/rustfs:1.0.6
+    command: ['/data']
+    environment:
+      RUSTFS_ACCESS_KEY: hw26user
+      RUSTFS_SECRET_KEY: hw26secretpass
+    tmpfs:
+      - /data:size=1g,mode=1777
+    ports:
+      - '127.0.0.1:${STORAGE_HOST_PORT:-9100}:9000'
+    healthcheck:
+      test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:9000/health']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
 volumes:
   pgdata-restore:
   redis-queue-data:

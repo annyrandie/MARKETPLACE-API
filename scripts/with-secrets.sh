@@ -110,4 +110,16 @@ from_vault REFRESH_TOKEN_PEPPER refresh_token_pepper
 from_vault JWT_PREVIOUS_PUBLIC_KEY jwt_previous_public_key.b64
 from_vault JWT_PREVIOUS_KID jwt_previous_kid
 
+# HW #26: object storage. The access key pair is the right to read and
+# write EVERY file in the bucket — vault only, per environment, no
+# fallback (same rule as the signing key above). Endpoint/bucket/region
+# are addresses, not secrets: they default to docker-compose.yml's
+# `storage` (RustFS on 127.0.0.1:9100), an already-exported value wins,
+# and an EMPTY STORAGE_ENDPOINT means real AWS S3.
+from_vault STORAGE_ACCESS_KEY storage_access_key
+from_vault STORAGE_SECRET_KEY storage_secret_key
+export STORAGE_ENDPOINT="${STORAGE_ENDPOINT-http://127.0.0.1:9100}"
+export STORAGE_BUCKET="${STORAGE_BUCKET:-marketplace-files}"
+export STORAGE_REGION="${STORAGE_REGION:-us-east-1}"
+
 exec "$@"

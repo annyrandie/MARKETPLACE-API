@@ -26,6 +26,9 @@ const { createSessionHandlers } = require('./dist/http/session.handlers');
 const { buildAuth } = require('./dist/auth');
 const { requireAuth, requireRole } = require('./dist/auth/middleware');
 const { createAuthHandlers } = require('./dist/http/auth.handlers');
+const { createS3 } = require('./dist/files/storage');
+const { FilesService } = require('./dist/files/files.service');
+const { createFilesHandlers } = require('./dist/http/files.handlers');
 
 // Fail-fast: either the process starts with a fully valid config, or it
 // doesn't start at all — and says in plain language which variable is
@@ -131,6 +134,24 @@ const auth = buildAuth(env, pool, (event, fields) =>
 );
 const authenticate = requireAuth(auth.service);
 const authHandlers = createAuthHandlers(auth.service);
+
+// HW #26: object storage. The S3 client only signs and makes control-plane
+// calls (create/list/complete multipart, HeadObject at commit) — the file
+// BYTES never pass through this process. Credentials from the validated
+// env (the vault); constructing the client opens no connection.
+const s3 = createS3({
+  endpoint: env.STORAGE_ENDPOINT,
+  region: env.STORAGE_REGION,
+  bucket: env.STORAGE_BUCKET,
+  accessKeyId: env.STORAGE_ACCESS_KEY,
+  secretAccessKey: env.STORAGE_SECRET_KEY,
+});
+const filesService = new FilesService(pool, s3, {
+  bucket: env.STORAGE_BUCKET,
+  putUrlTtlSeconds: env.UPLOAD_URL_TTL_SECONDS,
+  audit: (event, fields) => log('info', `[files] ${JSON.stringify({ event, ...fields })}`),
+});
+const filesHandlers = createFilesHandlers(filesService);
 
 const cardCache = new CacheAside(cacheRedis);
 const cardRepo = new ProductCardRepository(pool);
@@ -420,6 +441,13 @@ function createApp() {
   app.post('/sessions', loginLimiter.middleware(), sessionHandlers.login);
   app.get('/sessions/current', withSession, requireSession, sessionHandlers.current);
   app.delete('/sessions/current', withSession, requireSession, sessionHandlers.logout);
+
+  // HW #26: the two-step upload contract, under HW #24's guard. intent →
+  // the client PUTs straight to the storage → commit (HeadObject-checked).
+  app.post('/uploads/intent', authenticate, filesHandlers.intent);
+  app.get('/uploads/:fileId/parts', authenticate, filesHandlers.parts);
+  app.post('/uploads/commit', authenticate, filesHandlers.commit);
+  app.get('/files/:fileId', authenticate, filesHandlers.download);
 
   // HW #24: the HTTP surface of authentication.
   app.post('/auth/login', loginLimiter.middleware(), authHandlers.login);

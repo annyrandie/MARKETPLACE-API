@@ -55,6 +55,19 @@ const envSchema = z.object({
   // every token it signed has expired. Optional — empty outside a rotation.
   JWT_PREVIOUS_KID: z.string().optional().transform((v) => v || undefined),
   JWT_PREVIOUS_PUBLIC_KEY: z.string().optional().transform((v) => v || undefined),
+
+  // HW #26 — object storage. The key pair = read/write on every file in
+  // the bucket → vault only, no defaults. The rest are addresses.
+  STORAGE_ACCESS_KEY: z.string({ error: fromVault('object-storage access key id') }).min(1, fromVault('object-storage access key id')),
+  STORAGE_SECRET_KEY: z.string({ error: fromVault('object-storage secret key') }).min(1, fromVault('object-storage secret key')),
+  // empty → real AWS S3 (the SDK resolves the regional endpoint itself)
+  STORAGE_ENDPOINT: z.union([z.url({ protocol: /^https?$/ }), z.literal('')]).optional().transform((v) => v || undefined),
+  STORAGE_REGION: z.string().min(1).default('us-east-1'),
+  STORAGE_BUCKET: z.string().regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/, 'not a valid S3 bucket name').default('marketplace-files'),
+  // How long a presigned single-PUT URL lives. A presigned URL can't be
+  // revoked, so this is the only lever: 5 min (see README, Files). The cap
+  // is deliberate — a "7 days because SigV4 allows it" config is refused.
+  UPLOAD_URL_TTL_SECONDS: z.coerce.number().int().min(1).max(3600).default(300),
 }).superRefine((env, ctx) => {
   // Parse the keys NOW, before anything listens: a broken key should stop
   // the process at boot, not fail the first login an hour later.

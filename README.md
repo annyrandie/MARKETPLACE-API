@@ -50,7 +50,12 @@ refresh tokens stored as peppered HMACs and rotated with reuse detection
 (a replayed token revokes the whole family), a logout that kills both
 tokens in one transaction, and 401 kept strictly apart from 403 — role
 guards for writes, ownership checked on the loaded resource. Keys come
-from the vault only. See [Auth](#auth) below.
+from the vault only. See [Auth](#auth) below. HW #26 adds files: the
+client PUTs bytes straight to object storage on a presigned URL (the API
+can be down meanwhile), a commit that checks the storage with HeadObject,
+resumable multipart with a computed part size, and public assets served
+from a private bucket through a caching edge under content-hashed names,
+so a deploy needs zero invalidations. See [Files](#files) below.
 
 ## Quickstart for the grader
 
@@ -166,6 +171,15 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `src/auth/demo-auth.ts` / `demo-reuse.ts` / `demo-rbac.ts` / `demo-kit.ts` | `npm run demo:auth` / `demo:reuse` / `demo:rbac` + the shared start-the-app-and-clean-up kit |
 | `scripts/gen-jwt-keys.mjs` | `npm run keys:generate -- <env> [--rotate]` — keys into `secrets/<env>/`, prints fingerprints only |
 | `test/e2e/auth.e2e.test.js` / `test/testkit/auth.js` | auth regression tests; throwaway per-test-run signing keys |
+| `docker-compose.yml` → `storage` | HW #26: RustFS 1.0.6 (S3 API) on `127.0.0.1:9100`, 1 GiB tmpfs |
+| `src/migrations/…-Files.ts` | the `files` table: key, owner, status, sizes, ETag, multipart upload id, Idempotency-Key |
+| `src/files/storage.ts` | S3 client (`requestChecksumCalculation: 'WHEN_REQUIRED'`), `ensureBucket()` — private, lifecycle, CORS |
+| `src/files/upload-policy.ts` | content-type allowlist (ext, size cap, signature), computed threshold and part size |
+| `src/files/files.service.ts` / `src/http/files.handlers.ts` | intent → presigned PUT/parts, `ListParts` resume, HeadObject-checked commit, 302 download |
+| `src/files/edge.ts` / `src/files/assets.ts` | the caching edge in front of the private bucket; content-hashed immutable assets |
+| `src/files/demo-upload.ts` / `demo-multipart.ts` / `demo-cdn.ts` / `demo-kit.ts` / `client-*.ts` | the three demos, their cleanup, and the credential-less client processes |
+| `policies/cloudfront-oac-bucket-policy.json` | the AWS form: OAC bucket policy with `AWS:SourceArn` |
+| `test/e2e/files.e2e.test.js` | uploads against RustFS in testcontainers |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -218,6 +232,8 @@ touches `process.env` directly.
 | `REDIS_QUEUE_URL` | no | `redis://127.0.0.1:6380` | `.env.example`; with auth → the vault (`secrets/redis_queue_url`) | the state Redis (`noeviction`): sessions, rate limits, BullMQ — HW #23 |
 | `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `JWT_KID`, `REFRESH_TOKEN_PEPPER` | **yes** | — (none, on purpose) | the vault only — see [Auth](#auth) | HW #24 signing material |
 | `JWT_PREVIOUS_KID`, `JWT_PREVIOUS_PUBLIC_KEY` | no | — | the vault, during a key rotation | HW #24 overlap rotation |
+| `STORAGE_ACCESS_KEY`, `STORAGE_SECRET_KEY` | **yes** | — (none) | the vault only — see [Files](#files) | HW #26 object storage |
+| `STORAGE_ENDPOINT`, `STORAGE_BUCKET`, `STORAGE_REGION`, `UPLOAD_URL_TTL_SECONDS` | no | compose RustFS / `marketplace-files` / `us-east-1` / `300` | `.env.example` | HW #26 — see [Files](#files) |
 
 The DB password is deliberately **not** one of these variables — see
 [Secrets](#secrets) below for why.
@@ -258,7 +274,7 @@ moment they drift apart:
 
 ```bash
 npm run check:env
-# ✓ .env.example is in sync with the schema (13 variables)
+# ✓ .env.example is in sync with the schema (19 variables)
 ```
 
 ### Secrets
@@ -405,6 +421,14 @@ export JWT_PRIVATE_KEY="$(cat /tmp/priv.b64)"
 export JWT_PUBLIC_KEY="$(cat /tmp/pub.b64)"
 export REFRESH_TOKEN_PEPPER="$(node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64url"))')"
 
+# HW #26 — object storage: docker-compose.yml's `storage` (RustFS) — dev
+# credentials from the compose file, not a secret
+export STORAGE_ENDPOINT=http://127.0.0.1:9100
+export STORAGE_ACCESS_KEY=hw26user
+export STORAGE_SECRET_KEY=hw26secretpass
+export STORAGE_BUCKET=marketplace-files
+export STORAGE_REGION=us-east-1
+
 npm run migrate
 npm run migrate:show
 npm run seed
@@ -475,6 +499,14 @@ npm run demo:auth
 npm run demo:reuse
 npm run demo:rbac
 npm run test:e2e
+
+# HW #26 — files (storage exported at the top; `npm run migrate` above
+# applied the Files migration; each demo creates the bucket if needed and
+# cleans up after itself — demo:multipart is meant to be run twice)
+npm run demo:upload
+npm run demo:multipart
+npm run demo:multipart
+npm run demo:cdn
 ```
 
 (Port `6432`, not `5433` — every one of the commands above (`migrate`
@@ -2173,6 +2205,325 @@ The other suites now authenticate too:
 - **Sender-constrained tokens (DPoP / mTLS)** are the other branch of
   RFC 9700 §4.14.2, and this HW took the rotation branch instead.
 
+## Files
+
+HW #26 gives the course project files (product photos, avatars, the DB
+dumps from HW #15) without "a folder on the server". That design breaks on
+the first horizontal scale-out, because the instance that received a file
+and the instance that serves it are different machines. The full path is
+**accept → store → serve**, and each step has a deliberate price.
+
+| Step | How | Proven by |
+|---|---|---|
+| accept | `POST /uploads/intent` → the client PUTs **straight to object storage** on a presigned URL → `POST /uploads/commit` | `demo:upload`: `api-alive=0`, `put-offline=200` |
+| large files | multipart; the part size is **computed**; after a crash only the missing parts are re-sent (`ListParts`) | `demo:multipart`: `resumed-parts=1` |
+| serve (private) | `GET /files/{id}` → **302** to a one-minute presigned GET; the owner is checked on every access | `files.e2e` |
+| serve (public assets) | a **private** bucket behind a caching edge; content-hashed names + `immutable` → **no invalidation** | `demo:cdn`: `direct=403`, `cache-hit=1`, `content-changed=1` |
+
+### The storage: RustFS, not MinIO
+
+`docker-compose.yml` → `storage`: **`rustfs/rustfs:1.0.6`** on
+`127.0.0.1:9100`, with its data in a 1 GiB tmpfs.
+
+`minio/minio` and `minio/mc` were **removed from Docker Hub on
+2026-09-11**. A pinned tag doesn't help when the repository itself is
+gone, so a clean clone can't pull it. I probed the live alternatives
+against the exact behaviour this HW relies on (the probe script was a
+one-off, so the results are listed here):
+
+| | RustFS 1.0.6 | Garage 2.1 | LocalStack |
+|---|---|---|---|
+| anonymous GET | 403 | (S3 port always needs a signature) | — |
+| expired presigned PUT | **403** | **400** InvalidRequest | — |
+| tampered key in a presigned URL | 403 | 403 | — |
+| 1 KiB part mid-multipart | **EntityTooSmall** (like AWS) | **accepted** (lenient) | — |
+| ETag of a 3-part object | `…-3` | `…-3` | — |
+| starts without an account? | yes | yes | **no**: exits with "License activation failed", needs `LOCALSTACK_AUTH_TOKEN` |
+
+RustFS answers like AWS on every point. Its strictness matters most: a
+store that silently accepts a too-small part makes code "work" locally
+and fail in production. Lecture 26's Garage page found the same thing.
+Nothing in the code is RustFS-specific: it's the S3 API with
+`forcePathStyle` and an endpoint, and an **empty `STORAGE_ENDPOINT` means
+real AWS S3**.
+
+### Variables
+
+| Змінна | Джерело | Навіщо |
+|---|---|---|
+| `STORAGE_ACCESS_KEY` | сховище (#11): `secrets/<env>/storage_access_key` | ключ доступу до бакета — право читати й писати **всі** файли |
+| `STORAGE_SECRET_KEY` | сховище (#11): `secrets/<env>/storage_secret_key` | його секрет |
+| `STORAGE_ENDPOINT` | `.env` / wrapper default (compose) | S3 API; порожньо = справжній AWS S3 |
+| `STORAGE_BUCKET` | `.env` / default `marketplace-files` | приватний бакет |
+| `STORAGE_REGION` | `.env` / default `us-east-1` | регіон підпису SigV4 |
+| `UPLOAD_URL_TTL_SECONDS` | `.env` / default `300` (cap 3600) | строк presigned PUT — див. нижче |
+
+- **The credential pair comes only from the vault.** The zod schema has
+  no default for it. Bare `npm start` without it refuses to start and
+  names it, and `with-secrets.sh` exports it from `secrets/<env>/`.
+- **The endpoint, bucket and region are addresses, not secrets.** They
+  have defaults in the wrapper. `hw26user` / `hw26secretpass` are the
+  compose stand's dev credentials, the same class of value as
+  `admin-bootstrap-only`.
+- **This leak costs more than a leaked `DATABASE_URL`.** These keys are
+  read and write on every file in the bucket, from anywhere, with no
+  database or network access needed. In production, the app and the edge
+  would be separate IAM roles: the app can PUT, GET and manage multipart
+  under `uploads/*`, and the edge can only GET `assets/*`.
+
+### Step 1–3: intent → direct PUT → commit
+
+```
+POST /uploads/intent  {filename, content_type, size}     (Bearer, HW #24)
+  → 200 {file_id, key, mode, expires_in, put: {url, headers} | parts: [...]}
+PUT  <presigned url>  (bytes, straight to the storage — this API is not in the path)
+POST /uploads/commit  {file_id}
+  → 200 {status: COMPLETED, size, etag}   |  409 nothing/wrong size  |  422 not the declared type
+```
+
+- **The server generates the key:** `uploads/{userId}/{uuid}.{ext}`. The
+  extension comes from the content-type **allowlist** (jpeg / png / webp /
+  pdf / gzip / mp4, each with its own size cap). The client's `filename`
+  is stored as `original_name` for display and **never reaches the key**.
+  A key built from it would let the client write anywhere in the bucket
+  (`demo:upload`: `../../etc/passwd` → `uploads/222/17a27779-….png`).
+- **`ContentType` and `ContentLength` are signed into the PUT URL.**
+  Sending different bytes than declared makes the storage itself answer
+  403 (covered in `files.e2e`).
+- **`commit` trusts nothing the client says:**
+  1. For multipart, it completes the upload from the ETags the
+     **storage** lists.
+  2. `HeadObject` checks that the object exists (else 409) and that its
+     size equals the size declared at intent (else delete the object and
+     return 409).
+  3. A `Range: bytes=0-15` GET checks the first bytes against the declared
+     type's signature (else delete and return 422). `Content-Type` was
+     only the client's word.
+  4. Only then is the file `COMPLETED`.
+
+  Without this step, `commit-without-bytes` would be 200, and the
+  database would list a file that doesn't exist.
+- **The `files` table** (migration `…-Files.ts`) has `key`, `owner_id`,
+  `status` (PENDING/COMPLETED), `expected_size`, `size`, `etag`,
+  `upload_id`, `part_size`, `parts_count` and `idempotency_key`. The list
+  of a user's files is a query on this table, **never a bucket listing**,
+  which is paid, slow (1 000 keys per call) and knows nothing about owners.
+- **Idempotency-Key** (HW #22) on intent is optional. The row is claimed
+  first (`ON CONFLICT DO NOTHING`), so a double tap returns the same file
+  with fresh URLs and never creates a second object or multipart upload.
+- **Ownership** follows HW #24's rule on the loaded row: another user's
+  file is 403.
+
+### Presigned URL lifetime: 300 s, and why
+
+The main case is a photo or avatar picked in a form, and the PUT starts
+the moment the user confirms. **5 minutes** covers a slow mobile
+connection that needs a few retries to *start* the request. S3 checks the
+expiry when the request begins, not when it finishes, so a long upload
+that started in time completes.
+
+**A presigned URL cannot be revoked**: it has no `jti` and no registry.
+Of HW #24's revocation strategies, only a short lifetime works, so the
+lifetime *is* the revocation. The config caps it at 3600 s, so "7 days
+because SigV4 allows it" is refused. In production, 7 days is often an
+hour anyway: a presigned URL dies with the credentials that signed it,
+and an STS role session lasts 1 h by default.
+
+Related lifetimes:
+- **Multipart part URLs live 15 min.** A part may wait behind the others,
+  but `GET /uploads/{id}/parts` re-issues them on demand, so they never
+  need to outlive a resume.
+- **Download URLs live 60 s.** `GET /files/{id}` returns 302 to a fresh
+  one each time, and the client follows it immediately.
+
+Never put a presigned URL in an e-mail. Link to `/files/{id}` instead:
+the guard runs on every access, while the bytes still never pass through
+this service. **Presigned URLs are not logged**, because the URL *is* the
+access. Audit lines carry `file_id` and `key` only.
+
+`demo:upload` checks expiry with a URL issued by an app restarted with
+`UPLOAD_URL_TTL_SECONDS=2`. 300 s is too long to wait out in a demo. What
+it proves is "this URL dies at its expiry", whatever the number.
+
+### Multipart: the threshold and part size are computed
+
+| | Formula | Why |
+|---|---|---|
+| part size | `max(5 MiB, ⌈size / 10 000⌉ rounded up to 1 MiB)` | S3 allows at most **10 000** parts, each ≥ **5 MiB** except the last |
+| threshold | `2 × 5 MiB = 10 MiB` | below it, re-sending the whole file after a drop costs ≤ 10 MiB, less than three extra round trips (create, list, complete) |
+
+| File | Mode | Parts |
+|---|---|---|
+| 48 KiB avatar | single PUT | — |
+| 12 MiB dump (the demo) | multipart | 3 × 5 MiB (5 + 5 + 2) |
+| 100 GiB video | multipart | 9 310 × **11 MiB**, where a hardcoded 5 MiB would need 20 480 parts and fail |
+
+S3's docs list four benefits of multipart, and only one of them is about
+size. In this HW the point is **resuming**:
+`GET /uploads/{id}/parts` asks the **storage** (`ListParts`, paged by
+1 000) which parts it already holds and presigns only the missing ones.
+The client keeps no state between runs. In `demo:multipart`, the first
+client process is `SIGKILL`ed after 2 of 3 parts. A fresh process then
+finds 2 on the server and sends 1.
+
+Until `CompleteMultipartUpload` **there is no object**, only parts:
+`HeadObject` → 404. A finished multipart object's **ETag is
+`<hash>-N`**, where N is the number of parts. It is **not the file's
+MD5**, so "compare the ETag to a local MD5" silently breaks on multipart.
+
+**Housekeeping:**
+- **Lifecycle rule.** An unfinished multipart upload is billed even
+  though no object exists and the console doesn't show it.
+  `ensureBucket()` sets `AbortIncompleteMultipartUpload: 7 days`. A
+  "delete everything older than 30 days" rule doesn't touch these
+  uploads, because it's a different action.
+- **Orphan janitor (not implemented).** PENDING rows older than a day
+  should get `AbortMultipartUpload` → `DeleteObject` → delete the row.
+  The partial index `IDX_files_pending_created` exists for that query,
+  and HW #23's BullMQ scheduler (`upsertJobScheduler`) is its natural
+  home.
+
+### CDN in front of storage, with the storage closed
+
+**Form: local.** `src/files/edge.ts` is a ~40-line edge, run as its own
+process (`npm run edge`).
+
+- It reads objects from the **private** bucket with **its own
+  credentials**, caches them in memory, and answers with
+  `X-Cache: HIT|MISS`, plus an ETag and 304 on `If-None-Match`.
+- That's the essence of CloudFront OAC: the **cache** reaches the
+  storage, the public never does. A direct anonymous GET on the bucket
+  is 403.
+- **What gets cached is decided by the origin.** The edge caches only
+  what the *object's* `Cache-Control` marks `public` with a `max-age`.
+  The header is set on the object at upload (`publishAsset()`), never in
+  the edge. Without it, `cache-hit` would be 0.
+- **The edge serves only `assets/`.** User uploads (`uploads/…`) are
+  private and go through `GET /files/{id}`. The edge answers 404 for them
+  (`edge-serves-uploads=0`).
+
+**AWS form** (CloudFront + Origin Access Control). The bucket keeps
+**Block Public Access** on, and its policy lets exactly one distribution
+read exactly the public prefix
+([`policies/cloudfront-oac-bucket-policy.json`](policies/cloudfront-oac-bucket-policy.json)):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "AllowCloudFrontOACReadOfPublicAssetsOnly",
+    "Effect": "Allow",
+    "Principal": { "Service": "cloudfront.amazonaws.com" },
+    "Action": "s3:GetObject",
+    "Resource": "arn:aws:s3:::marketplace-files/assets/*",
+    "Condition": { "StringEquals": {
+      "AWS:SourceArn": "arn:aws:cloudfront::111122223333:distribution/EDFDVBD6EXAMPLE" } }
+  }]
+}
+```
+
+- **The `Condition` on `AWS:SourceArn` is mandatory.**
+  `Principal: cloudfront.amazonaws.com` alone means "any CloudFront
+  distribution in the world", including an attacker's distribution
+  pointed at this bucket.
+- **The `Resource` is `assets/*`, not `*`.** Private uploads aren't
+  readable even by the CDN.
+- **Private content through CloudFront** (a plan, not required here):
+  CloudFront signed URLs or signed cookies, using a key pair whose
+  private half lives in the vault. Leaking that key means anyone can
+  grant access to all private content of the distribution.
+
+### Updates without invalidation
+
+Public assets are **content-addressed**: `publishAsset('app.css', body)`
+gives `assets/app.<first 8 hex of sha256>.css` with
+`Cache-Control: public, max-age=31536000, immutable`.
+
+- **A deploy publishes the new content under a new name.** New HTML
+  points to it, and the old URL keeps serving the old bytes from every
+  cache until it ages out, while nobody requests it any more.
+  **Invalidations: 0.**
+- **An object under a hashed name is never overwritten.** If it exists,
+  it already holds exactly these bytes.
+- This is AWS's own recommendation for frequently updated files:
+  versioned file names first, invalidation only as a last resort.
+
+### The three demos, this run's numbers
+
+Each demo cleans up its own state at the start and at the end:
+- its users (with their `files` rows);
+- every object under their `uploads/{id}/` prefix;
+- **every unfinished multipart upload** there (`ListMultipartUploads` →
+  `AbortMultipartUpload`);
+- for `demo:cdn`, its `assets/demo-cdn/` prefix.
+
+The app and the edge are child processes on free ports, killed on every
+exit path.
+
+```bash
+npm run demo:upload
+# intent=200
+# key-from-server=1              # filename "../../etc/passwd" → uploads/222/17a27779-….png
+# commit-without-bytes=409       # HeadObject: nothing there
+# tampered=403                   # another key in the signed URL's path
+# api-alive=0                    # our API is DOWN (raw TCP connect fails)…
+# put-offline=200                # …and the bytes reach the storage anyway,
+# client-credential-vars=0       #   from a process with no credentials at all
+# commit=200                     # API back up on a NEW port; HeadObject + size + PNG signature
+# commit-status-completed=1
+# download-redirect=302          # GET /files/:id → presigned GET, 60 s
+# download-same-bytes=1
+# expired=403
+
+npm run demo:multipart           # run twice in a row: identical output
+# file-size=12582912
+# part-size=5242880              # computed: max(5 MiB, size/10 000)
+# parts=3
+# first-client-killed=1          # SIGKILL after parts 1 and 2
+# parts-before-resume=2          # ListParts: the storage holds them…
+# head-before-complete=404       # …but there is no object yet
+# already-on-server=2            # the fresh process asks, the storage answers
+# resumed-parts=1                # only part 3 is sent
+# complete=200
+# size-match=1
+# etag-multipart=1               # "…-3"
+# etag-is-md5=0
+
+npm run demo:cdn
+# direct=403                     # anonymous GET straight at the bucket
+# edge-miss=200
+# edge-miss-header=1
+# edge-hit=200
+# cache-hit=1                    # X-Cache: HIT
+# immutable-header=1             # Cache-Control came from the object
+# new-name=1                     # app.e2f66b6e.css → app.a89ffdd9.css
+# new-url=200
+# content-changed=1
+# old-url-still-cached=1         # the old entry harms nobody…
+# invalidations=0                # …so nothing was purged
+# edge-serves-uploads=0
+```
+
+`test/e2e/files.e2e.test.js` (RustFS in testcontainers) covers what the
+demos don't print:
+- another user's file → 403;
+- a different byte count → the storage itself answers 403;
+- a lying content type → 422 and the object is deleted;
+- the allowlist and size caps;
+- a double tap → one file;
+- the computed part size (100 GiB → 11 MiB).
+
+### Backups (HW #15's debt)
+
+HW #15 put dumps in a local folder, and "S3 properly — in #26" was its own
+note. The destination now exists: a dump is an `application/gzip` upload,
+multipart above 10 MiB and therefore resumable, and a lifecycle rule can
+move it to a cheaper storage class. Two honest caveats:
+- **Glacier-class storage breaks RTO**, because the object has to be
+  restored before it can be downloaded.
+- **Lifecycle doesn't make a backup *verified*.** The restore drill from
+  HW #15 still stands.
+
 ## Verification (acceptance criteria)
 
 Spec is valid:
@@ -2191,10 +2542,11 @@ const ops=Object.entries(s.paths).flatMap(([p,v])=>Object.keys(v).filter(m=>M.in
 const idem=ops.flatMap(([p,m])=>s.paths[p][m].parameters??[]).find(x=>x.in==='header'&&/idempotency-key/i.test(x.name));\
 console.log('operations:',ops.length,'· resources:',new Set(Object.keys(s.paths).map(p=>p.split('/')[1])).size);\
 console.log('Idempotency-Key: required =',idem?.required,'· description length =',(idem?.description??'').trim().length)"
-# expected: operations: 17 · resources: 6 · required = true · description length = 393
+# expected: operations: 21 · resources: 8 · required = true · description length = 393
 # (HW #9 shipped 6 · 2; HW #18 added PATCH …/status + GET …/events, HW #19 POST /checkout,
 #  HW #23 GET /product-cards/{id} + POST /sessions + GET/DELETE /sessions/current,
-#  HW #24 POST /auth/login + /auth/refresh + /auth/logout + GET /auth/me.
+#  HW #24 POST /auth/login + /auth/refresh + /auth/logout + GET /auth/me,
+#  HW #26 POST /uploads/intent + GET /uploads/{id}/parts + POST /uploads/commit + GET /files/{id}.
 #  The first Idempotency-Key found is still POST /orders' — hence the same 393)
 ```
 
