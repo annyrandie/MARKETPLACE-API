@@ -36,14 +36,33 @@ export interface HttpResult<T = any> {
 }
 
 export interface AuthDemo {
-  baseUrl: string;
+  /** the running app's URL — changes after restartApp() */
+  readonly baseUrl: string;
+  readonly port: number;
   users: Record<string, DemoUser>;
+  /** the demo's own (privileged) DB connection — DB_* from the wrapper */
+  pool: Pool;
   /** Everything the app printed — for "was the reuse logged?" checks. */
   appOutput(): string;
   call<T = any>(method: string, urlPath: string, opts?: { token?: string; body?: unknown; headers?: Record<string, string> }): Promise<HttpResult<T>>;
   login(user: DemoUser): Promise<HttpResult<{ access_token: string; refresh_token: string }>>;
+  /** Kill the app (SIGKILL) and wait until it's gone. */
+  stopApp(): Promise<void>;
+  /** Start the app again — on a NEW free port (a restarted server on the
+   *  same port can hand fetch's keep-alive pool a dead socket). */
+  restartApp(extraEnv?: Record<string, string>): Promise<void>;
+  /** Run before the demo's users are deleted, on every exit path. */
+  onCleanup(fn: () => Promise<void>): void;
   /** Clean up, print key=number lines, check the invariant, exit. */
   finish(summary: Record<string, number>, invariant: Record<string, boolean>): Promise<never>;
+}
+
+export interface AuthDemoOptions {
+  /** Called with the PREVIOUS run's user ids before they're deleted — for
+   *  state that isn't in Postgres (objects in the bucket, say). */
+  beforeReset?: (pool: Pool, oldUserIds: string[]) => Promise<void>;
+  /** Extra env for the first app start. */
+  appEnv?: Record<string, string>;
 }
 
 function freePort(): Promise<number> {
@@ -63,14 +82,18 @@ function requireEnv(name: string): string {
   return v;
 }
 
-async function reset(pool: Pool, emailLike: string): Promise<void> {
+async function reset(pool: Pool, emailLike: string, beforeReset?: AuthDemoOptions['beforeReset']): Promise<void> {
+  if (beforeReset) {
+    const { rows } = await pool.query<{ id: string }>(`SELECT id::text AS id FROM users WHERE email LIKE $1`, [emailLike]);
+    if (rows.length) await beforeReset(pool, rows.map((r) => r.id));
+  }
   await pool.query(`DELETE FROM users WHERE email LIKE $1`, [emailLike]);
 }
 
-export async function openAuthDemo(tag: string, specs: Record<string, Role>): Promise<AuthDemo> {
+export async function openAuthDemo(tag: string, specs: Record<string, Role>, opts: AuthDemoOptions = {}): Promise<AuthDemo> {
   const pool = createDbPool();
   const emailLike = `auth-${tag}-%@example.test`;
-  await reset(pool, emailLike);
+  await reset(pool, emailLike, opts.beforeReset);
 
   const runId = Date.now();
   const users: Record<string, DemoUser> = {};
@@ -92,59 +115,82 @@ export async function openAuthDemo(tag: string, specs: Record<string, Role>): Pr
   writeFileSync(passwordFile, requireEnv('DB_PASSWORD'), { mode: 0o600 });
   const dbUrl = `postgres://${encodeURIComponent(requireEnv('DB_USER'))}@${requireEnv('DB_HOST')}:${requireEnv('DB_PORT')}/${requireEnv('DB_NAME')}`;
 
-  const port = await freePort();
-  const baseUrl = `http://127.0.0.1:${port}`;
   let output = '';
-  const child: ChildProcess = spawn(process.execPath, [path.resolve(__dirname, '..', '..', 'app.js')], {
-    env: { ...process.env, DB_URL: dbUrl, DB_PASSWORD_FILE: passwordFile, PORT: String(port), LOG_LEVEL: 'info' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  child.stdout!.on('data', (d) => (output += d));
-  child.stderr!.on('data', (d) => (output += d));
+  let child: ChildProcess | undefined;
+  let port = 0;
+  let baseUrl = '';
   // whatever happens to this process, the app goes with it
-  const killChild = () => child.exitCode === null && child.kill('SIGKILL');
+  const killChild = () => {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  };
   process.on('exit', killChild);
 
+  const hooks: Array<() => Promise<void>> = [];
   let cleaned = false;
   const cleanup = async () => {
     if (cleaned) return;
     cleaned = true;
     killChild();
+    for (const fn of hooks) await fn().catch((err) => console.error('cleanup hook failed:', err));
     await reset(pool, emailLike).catch(() => {});
     await pool.end().catch(() => {});
     rmSync(tmp, { recursive: true, force: true });
   };
 
-  // wait for /health (the app validates config first, then listens)
-  const deadline = Date.now() + 20_000;
-  for (;;) {
-    if (child.exitCode !== null) {
-      await cleanup();
-      throw new Error(`app exited with code ${child.exitCode} before becoming healthy:\n${output}`);
+  const launch = async (extraEnv: Record<string, string> = {}) => {
+    port = await freePort();
+    baseUrl = `http://127.0.0.1:${port}`;
+    const proc = spawn(process.execPath, [path.resolve(__dirname, '..', '..', 'app.js')], {
+      env: { ...process.env, DB_URL: dbUrl, DB_PASSWORD_FILE: passwordFile, PORT: String(port), LOG_LEVEL: 'info', ...extraEnv },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child = proc;
+    proc.stdout!.on('data', (d) => (output += d));
+    proc.stderr!.on('data', (d) => (output += d));
+
+    // wait for /health (the app validates config first, then listens)
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      if (proc.exitCode !== null) {
+        await cleanup();
+        throw new Error(`app exited with code ${proc.exitCode} before becoming healthy:\n${output}`);
+      }
+      try {
+        if ((await fetch(`${baseUrl}/health`)).ok) break;
+      } catch {
+        /* not listening yet */
+      }
+      if (Date.now() > deadline) {
+        await cleanup();
+        throw new Error(`app did not become healthy in 20s:\n${output}`);
+      }
+      await new Promise((r) => setTimeout(r, 100));
     }
-    try {
-      if ((await fetch(`${baseUrl}/health`)).ok) break;
-    } catch {
-      /* not listening yet */
-    }
-    if (Date.now() > deadline) {
-      await cleanup();
-      throw new Error(`app did not become healthy in 20s:\n${output}`);
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
+  };
+
+  const stopApp = async () => {
+    const proc = child;
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+    await new Promise<void>((resolve) => {
+      proc.once('exit', () => resolve());
+      proc.kill('SIGKILL');
+    });
+  };
+
+  await launch(opts.appEnv);
   const authLine = /auth: signing kid=\S+ SHA256:\S+/.exec(output)?.[0];
   if (authLine) console.error(authLine); // which key signed this run — fingerprint, never the key
 
-  const call: AuthDemo['call'] = async (method, urlPath, opts = {}) => {
+  const call: AuthDemo['call'] = async (method, urlPath, callOpts = {}) => {
     const res = await fetch(baseUrl + urlPath, {
       method,
+      redirect: 'manual',
       headers: {
-        ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}),
-        ...(opts.token ? { authorization: `Bearer ${opts.token}` } : {}),
-        ...opts.headers,
+        ...(callOpts.body !== undefined ? { 'content-type': 'application/json' } : {}),
+        ...(callOpts.token ? { authorization: `Bearer ${callOpts.token}` } : {}),
+        ...callOpts.headers,
       },
-      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      body: callOpts.body !== undefined ? JSON.stringify(callOpts.body) : undefined,
     });
     const text = await res.text();
     let body: any = text;
@@ -153,16 +199,29 @@ export async function openAuthDemo(tag: string, specs: Record<string, Role>): Pr
     } catch {
       /* not JSON */
     }
+    if (res.status >= 300 && res.status < 400) body = { location: res.headers.get('location') };
     console.error(`${method} ${urlPath} → ${res.status}`);
     return { status: res.status, body };
   };
 
   return {
-    baseUrl,
+    get baseUrl() {
+      return baseUrl;
+    },
+    get port() {
+      return port;
+    },
     users,
+    pool,
     appOutput: () => output,
     call,
     login: (user) => call('POST', '/auth/login', { body: { email: user.email, password: user.password } }),
+    stopApp,
+    async restartApp(extraEnv) {
+      await stopApp();
+      await launch(extraEnv);
+    },
+    onCleanup: (fn) => void hooks.push(fn),
     async finish(summary, invariant) {
       await cleanup();
       for (const [k, v] of Object.entries(summary)) console.log(`${k}=${v}`);

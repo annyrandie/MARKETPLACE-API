@@ -21,7 +21,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const { Verifier } = require('@pact-foundation/pact');
 const { startPg } = require('../integration/testkit/container');
-const { useThrowawayAuthKeys, signAccessToken } = require('../testkit/auth');
+const { useThrowawayAuthKeys, useDummyStorage, signAccessToken } = require('../testkit/auth');
 const { ORDER_ALREADY_EXISTS_FOR_KEY } = require('./provider-states');
 
 const IDEMPOTENCY_KEY = 'contract-test-key-1';
@@ -52,6 +52,7 @@ async function main() {
     // real one); requestFilter swaps in a token this provider will accept
     // — Pact's documented way to handle auth in provider verification.
     useThrowawayAuthKeys();
+    useDummyStorage();
     const buyerToken = signAccessToken('1', 'buyer');
 
     // eslint-disable-next-line global-require

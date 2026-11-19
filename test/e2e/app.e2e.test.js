@@ -10,7 +10,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const request = require('supertest');
 const { startPg } = require('../integration/testkit/container');
-const { useThrowawayAuthKeys, signAccessToken } = require('../testkit/auth');
+const { useThrowawayAuthKeys, useDummyStorage, signAccessToken } = require('../testkit/auth');
 
 describe('E2E: full Express app, no provider substitution, DB from testcontainer', () => {
   let pg;
@@ -26,6 +26,7 @@ describe('E2E: full Express app, no provider substitution, DB from testcontainer
     fs.writeFileSync(passwordFile, decodeURIComponent(dbUrl.password));
     dbUrl.password = '';
     useThrowawayAuthKeys();
+    useDummyStorage();
 
     // app.js validates env and builds its pg.Pool at require-time (fail-fast
     // config, see app.js's own header comment) — these MUST be set before

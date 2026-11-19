@@ -10,7 +10,7 @@ const os = require('node:os');
 const { GenericContainer, Wait } = require('testcontainers');
 const request = require('supertest');
 const { startPg } = require('../integration/testkit/container');
-const { useThrowawayAuthKeys, signAccessToken } = require('../testkit/auth');
+const { useThrowawayAuthKeys, useDummyStorage, signAccessToken } = require('../testkit/auth');
 
 const PASSWORD = 'redis-e2e-password';
 
@@ -45,6 +45,7 @@ describe('E2E: Redis-backed routes in the real app (HW #23)', () => {
     process.env.REDIS_QUEUE_URL = `redis://${stateBox.getHost()}:${stateBox.getMappedPort(6379)}`;
     process.env.LOG_LEVEL = 'error';
     useThrowawayAuthKeys();
+    useDummyStorage();
 
     ({ closeResources } = require('../../app'));
     app = require('../../app').createApp();

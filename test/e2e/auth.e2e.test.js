@@ -8,7 +8,7 @@ const os = require('node:os');
 const request = require('supertest');
 const jwt = require('jsonwebtoken');
 const { startPg } = require('../integration/testkit/container');
-const { useThrowawayAuthKeys } = require('../testkit/auth');
+const { useThrowawayAuthKeys, useDummyStorage } = require('../testkit/auth');
 
 const PASSWORD = 'auth-e2e-password';
 
@@ -32,6 +32,7 @@ describe('E2E: authentication — rotation with reuse detection, logout, 401s', 
     // — it fails OPEN by design, so logins still go through
     process.env.REDIS_QUEUE_URL = 'redis://127.0.0.1:1';
     useThrowawayAuthKeys();
+    useDummyStorage();
 
     ({ closeResources } = require('../../app'));
     app = require('../../app').createApp();
