@@ -20,6 +20,16 @@ export class User {
   @Column({ type: 'int', name: 'balance_cents', default: 0 })
   balanceCents: number;
 
+  // HW #24: scrypt hash (src/auth/password.ts); never selected by default
+  // so no query that loads a User accidentally carries it around.
+  @Column({ type: 'text', name: 'password_hash', nullable: true, select: false })
+  passwordHash: string | null;
+
+  // HW #24: the source of truth for authorization — the access token only
+  // carries a copy (a cache until its exp). CHECK constraint in the migration.
+  @Column({ type: 'varchar', length: 16, name: 'role', default: 'buyer' })
+  role: 'buyer' | 'seller' | 'admin';
+
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
   createdAt: Date;
 

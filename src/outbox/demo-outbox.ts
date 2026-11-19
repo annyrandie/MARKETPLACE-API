@@ -18,6 +18,14 @@ async function main(): Promise<void> {
 
   const app = express();
   app.use(express.json());
+  // HW #24: the handler takes the buyer from req.auth (set by requireAuth
+  // in app.js), never from the body. This throwaway server has no token
+  // layer — it stands in for it with the demo's own buyer; what's under
+  // test here is the outbox, not authentication (that's demo:auth).
+  app.use((req, _res, next) => {
+    req.auth = { sub: demo.userId, role: 'buyer', fid: 'demo-outbox', jti: 'demo-outbox', exp: 0 };
+    next();
+  });
   app.post('/checkout', createCheckoutHandler(new CheckoutService(demo.ds)));
   app.use((err: Error & { status?: number }, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(err.status ?? 500).json({ detail: err.message });
@@ -30,7 +38,7 @@ async function main(): Promise<void> {
   // the key while the first one's transaction may still be open — that's
   // the race the ON CONFLICT claim in checkout() exists for.
   const key = `${demo.keyPrefix}${Date.now()}`;
-  const body = JSON.stringify({ user_id: demo.userId, product_id: demo.productId, quantity: 2 });
+  const body = JSON.stringify({ product_id: demo.productId, quantity: 2 });
   const send = () =>
     fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'idempotency-key': key }, body });
   const responses = await Promise.all([send(), send()]);

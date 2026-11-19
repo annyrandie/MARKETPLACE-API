@@ -26,8 +26,11 @@ export function createCheckoutHandler(service: CheckoutService, opts: CheckoutHa
       const idempotencyKey = req.header('idempotency-key');
       if (!idempotencyKey) throw httpError(400, 'Idempotency-Key header is required');
 
-      const { user_id, product_id, quantity } = req.body;
-      const result = await service.placeOrder(idempotencyKey, user_id, product_id, quantity);
+      // HW #24: the buyer is whoever the access token says (requireAuth runs
+      // first) — never a body field, or anyone could buy "as" anyone.
+      if (!req.auth) throw httpError(401, 'missing bearer token');
+      const { product_id, quantity } = req.body;
+      const result = await service.placeOrder(idempotencyKey, req.auth.sub, product_id, quantity);
       // Same status on a replay as on the first call (the client asked for
       // the same thing and gets the same answer), flagged the same way
       // POST /orders (HW #9) already flags its own replays.

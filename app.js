@@ -23,6 +23,9 @@ const { RedisSessionStore, sessionMiddleware, requireSession } = require('./dist
 const { ProductCardRepository, productCardKey } = require('./dist/repositories/product-card.repository');
 const { createProductCardHandler } = require('./dist/http/product-card.handler');
 const { createSessionHandlers } = require('./dist/http/session.handlers');
+const { buildAuth } = require('./dist/auth');
+const { requireAuth, requireRole } = require('./dist/auth/middleware');
+const { createAuthHandlers } = require('./dist/http/auth.handlers');
 
 // Fail-fast: either the process starts with a fully valid config, or it
 // doesn't start at all — and says in plain language which variable is
@@ -120,15 +123,27 @@ for (const [name, client] of [['cache', cacheRedis], ['state', stateRedis]]) {
   client.on('error', (err) => log('warn', `[redis ${name}] ${err.message}`));
 }
 
+// HW #24: authentication. Keys come from the validated env (the vault,
+// never a default) and are parsed into KeyObjects once, here. The audit
+// callback gets ids only (user, family, jti) — never a token.
+const auth = buildAuth(env, pool, (event, fields) =>
+  log(event.endsWith('_detected') ? 'warn' : 'info', `[auth] ${JSON.stringify({ event, ...fields })}`),
+);
+const authenticate = requireAuth(auth.service);
+const authHandlers = createAuthHandlers(auth.service);
+
 const cardCache = new CacheAside(cacheRedis);
 const cardRepo = new ProductCardRepository(pool);
 const sessionStore = new RedisSessionStore(stateRedis);
-const sessionHandlers = createSessionHandlers(sessionStore, pool);
+const sessionHandlers = createSessionHandlers(sessionStore, (email, password) =>
+  auth.service.verifyCredentials(email, password),
+);
 const withSession = sessionMiddleware(sessionStore);
 
-// Per-IP sliding windows on the state box, shared by every instance of
-// this app. Login is the tight one: it's the brute-force/enumeration
-// surface (and has no password yet — see session.handlers.ts).
+// Sliding windows on the state box, shared by every instance of this app.
+// Login is the tight one — the brute-force surface — keyed per (IP,
+// e-mail): one account can't be hammered, and one office NAT doesn't lock
+// everybody behind it out at once.
 const cardLimiter = new RedisRateLimiter(stateRedis, {
   limit: 60,
   windowMs: 60_000,
@@ -139,7 +154,7 @@ const loginLimiter = new RedisRateLimiter(stateRedis, {
   limit: 10,
   windowMs: 60_000,
   prefix: 'login',
-  clientId: (req) => req.ip,
+  clientId: (req) => `${req.ip}:${String(req.body?.email ?? '').toLowerCase()}`,
 });
 
 
@@ -281,9 +296,10 @@ function createApp() {
   // useful to check here. Documented in openapi/openapi.yaml anyway, for
   // discoverability, just not enforced there (see that path's own comment).
   // getOwnedOrder, not a bare existence check: the handler enforces the
-  // same ownership rule the WebSocket join does (X-User-Id must match)
-  // — this used to be the one door onto order events that checked nothing.
-  app.get('/orders/:orderId/events', createOrderEventsSseHandler(orderEvents, getOwnedOrder));
+  // same ownership rule the WebSocket join does. HW #24: the caller is
+  // whoever the bearer token says (requireAuth), not an X-User-Id header
+  // anybody could set.
+  app.get('/orders/:orderId/events', authenticate, createOrderEventsSseHandler(orderEvents, getOwnedOrder));
 
   app.use(express.json());
 
@@ -305,7 +321,9 @@ function createApp() {
     res.json(paginate(sorted, req));
   });
 
-  app.post('/products', (req, res) => {
+  // HW #24, authorization by ROLE: writing the catalog is for sellers and
+  // admins. A buyer is authenticated (no 401) but not allowed (403).
+  app.post('/products', authenticate, requireRole('seller', 'admin'), (req, res) => {
     const id = `prod_${nextProductSeq++}`;
     const product = { id, name: req.body.name, price_cents: req.body.price_cents, created_at: new Date().toISOString() };
     products.set(id, product);
@@ -320,20 +338,26 @@ function createApp() {
     res.json(product);
   });
 
-  app.get('/orders', (req, res) => {
-    const sorted = Array.from(orders.values()).sort(compareByKeyset);
+  // HW #24: a list is filtered by owner in the "query" itself — the same
+  // place a WHERE user_id = $sub would go — not by a guard. Admins see all.
+  app.get('/orders', authenticate, (req, res) => {
+    const visible = Array.from(orders.values()).filter((o) => req.auth.role === 'admin' || o.userId === req.auth.sub);
+    const sorted = visible.sort(compareByKeyset);
     const page = paginate(sorted, req);
     res.json({ ...page, items: page.items.map(toPublicOrder) });
   });
 
-  app.post('/orders', (req, res, next) => {
+  app.post('/orders', authenticate, (req, res, next) => {
     try {
       // Express (and express-openapi-validator) always lowercases header
       // names in req.headers, regardless of how the spec or the client wrote them.
       const idempotencyKey = req.headers['idempotency-key'];
       const bodyHash = hashBody(req.body);
+      // HW #24: keys are scoped per buyer — two buyers' "abc" never collide,
+      // and one buyer can't replay (= read) another's order through a key.
+      const scopedKey = `${req.auth.sub}\u0000${idempotencyKey}`;
 
-      const existing = idempotencyStore.get(idempotencyKey);
+      const existing = idempotencyStore.get(scopedKey);
       if (existing) {
         if (existing.bodyHash !== bodyHash) {
           throw new ProblemError(
@@ -356,14 +380,11 @@ function createApp() {
         0,
       );
 
-      // HW #18: an order's "owner", for the WebSocket join guard
-      // (orders.gateway.ts) to check against — not part of the documented
-      // request body (NewOrder has additionalProperties: false), so it
-      // travels as a header instead, the same place Idempotency-Key does.
-      // No X-User-Id at all just means this order has no one who can join
-      // its realtime room — anonymous order creation still works exactly
-      // as before this HW, same as it always has.
-      const userId = req.headers['x-user-id'] || null;
+      // The order's owner = the authenticated caller (HW #24). Until HW #24
+      // this came from an X-User-Id header — i.e. "on behalf of whoever
+      // you typed in". Ownership checks (GET /orders/:id, SSE, WebSocket
+      // join) compare against this.
+      const userId = req.auth.sub;
 
       const order = {
         id: `order_${nextOrderSeq++}`,
@@ -374,7 +395,7 @@ function createApp() {
         userId,
       };
       orders.set(order.id, order);
-      idempotencyStore.set(idempotencyKey, { bodyHash, status: 201, response: toPublicOrder(order) });
+      idempotencyStore.set(scopedKey, { bodyHash, status: 201, response: toPublicOrder(order) });
 
       res.status(201).json(toPublicOrder(order));
     } catch (err) {
@@ -384,8 +405,10 @@ function createApp() {
 
   // HW #23: a placed order changes the product's stock → its cached card
   // goes stale (served once more while one request refreshes it).
+  // HW #24: the buyer is the token's subject — no longer a body field.
   app.post(
     '/checkout',
+    authenticate,
     createCheckoutHandler(checkoutService, { onPlaced: (productId) => cardCache.markStale(productCardKey(productId)) }),
   );
 
@@ -398,10 +421,23 @@ function createApp() {
   app.get('/sessions/current', withSession, requireSession, sessionHandlers.current);
   app.delete('/sessions/current', withSession, requireSession, sessionHandlers.logout);
 
-  app.get('/orders/:orderId', (req, res, next) => {
+  // HW #24: the HTTP surface of authentication.
+  app.post('/auth/login', loginLimiter.middleware(), authHandlers.login);
+  app.post('/auth/refresh', authHandlers.refresh);
+  app.post('/auth/logout', authenticate, authHandlers.logout);
+  app.get('/auth/me', authenticate, authHandlers.me);
+
+  // HW #24, authorization by OWNERSHIP — deliberately not a guard: a guard
+  // runs before the order is loaded and has no owner to compare with. The
+  // check sits right after the load, on the loaded resource (with a DB it
+  // would be `WHERE id = $1 AND user_id = $sub` in the query itself).
+  app.get('/orders/:orderId', authenticate, (req, res, next) => {
     const order = orders.get(req.params.orderId);
     if (!order) {
       return next(new ProblemError(404, `Order "${req.params.orderId}" was not found`));
+    }
+    if (order.userId !== req.auth.sub && req.auth.role !== 'admin') {
+      return next(new ProblemError(403, `Order "${req.params.orderId}" does not belong to the caller`));
     }
     res.json(toPublicOrder(order));
   });
@@ -411,7 +447,8 @@ function createApp() {
   // controller calling the gateway/SSE transport directly — orders.gateway.ts
   // and orders.controller.ts only ever learn about a status change by
   // subscribing to orderEvents, the same as any other subscriber would.
-  app.patch('/orders/:orderId/status', (req, res, next) => {
+  // HW #24: fulfilment (status changes) is staff work — sellers and admins.
+  app.patch('/orders/:orderId/status', authenticate, requireRole('seller', 'admin'), (req, res, next) => {
     const order = orders.get(req.params.orderId);
     if (!order) {
       return next(new ProblemError(404, `Order "${req.params.orderId}" was not found`));
@@ -458,13 +495,16 @@ function createApp() {
 function createHttpServer() {
   const app = createApp();
   const server = http.createServer(app);
-  attachOrdersGateway(server, orderEvents, getOwnedOrder);
+  // HW #24: the handshake carries the same bearer token, verified the same
+  // way (signature + revocation) as every HTTP request.
+  attachOrdersGateway(server, orderEvents, getOwnedOrder, (token) => auth.service.authenticate(token));
   return server;
 }
 
 module.exports = { createApp, createHttpServer, closeResources };
 
 if (require.main === module) {
+  log('info', `auth: ${auth.describe()}`);
   createHttpServer().listen(env.PORT, () => {
     log('info', `marketplace-api listening on http://localhost:${env.PORT} (WebSocket + SSE realtime enabled)`);
   });

@@ -20,7 +20,8 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 const { Verifier } = require('@pact-foundation/pact');
-const { PostgreSqlContainer } = require('@testcontainers/postgresql');
+const { startPg } = require('../integration/testkit/container');
+const { useThrowawayAuthKeys, signAccessToken } = require('../testkit/auth');
 const { ORDER_ALREADY_EXISTS_FOR_KEY } = require('./provider-states');
 
 const IDEMPOTENCY_KEY = 'contract-test-key-1';
@@ -29,22 +30,29 @@ const PROVIDER_PORT = Number(process.env.PROVIDER_PORT || 4100);
 const PACT_FILE = path.resolve(__dirname, '..', '..', 'pacts', 'marketplace-web-marketplace-api.json');
 
 async function main() {
-  // A real testcontainer backs the app's config/pg.Pool the same way it
-  // does in test/e2e — app.js fails fast without a valid DB_URL, and its
-  // /health route genuinely queries this. The interaction being verified
-  // here doesn't itself need a DB write (see the state handler below), but
-  // the running app it's served FROM still needs a real Postgres to exist.
-  const container = await new PostgreSqlContainer('postgres:16-alpine').start();
+  // A real, MIGRATED testcontainer backs the app the same way it does in
+  // test/e2e — app.js fails fast without a valid DB_URL, and since HW #24
+  // every guarded route (POST /orders included) checks token revocation in
+  // Postgres, so the auth tables have to exist.
+  const pg = await startPg();
+  const dbUrl = new URL(pg.uri);
   const passwordFile = path.join(os.tmpdir(), `marketplace-verify-password-${Date.now()}`);
-  fs.writeFileSync(passwordFile, container.getPassword());
+  fs.writeFileSync(passwordFile, decodeURIComponent(dbUrl.password));
+  dbUrl.password = '';
 
   // Everything from here on can fail (a busy PROVIDER_PORT, a Verifier
   // error) — this try/finally is what guarantees the container and temp
   // password file above are always cleaned up, not just on the happy path.
   try {
-    process.env.DB_URL = `postgres://${container.getUsername()}@${container.getHost()}:${container.getMappedPort(5432)}/${container.getDatabase()}`;
+    process.env.DB_URL = dbUrl.toString();
     process.env.DB_PASSWORD_FILE = passwordFile;
     process.env.LOG_LEVEL = 'error';
+    // HW #24: throwaway signing keys for this run, and one buyer's token.
+    // The contract only says "a bearer token" (the consumer can't know a
+    // real one); requestFilter swaps in a token this provider will accept
+    // — Pact's documented way to handle auth in provider verification.
+    useThrowawayAuthKeys();
+    const buyerToken = signAccessToken('1', 'buyer');
 
     // eslint-disable-next-line global-require
     const { createApp } = require('../../app');
@@ -76,13 +84,22 @@ async function main() {
           // app.js's unconditional seedProducts() would keep satisfying
           // whether or not any handler ran at all.
           [ORDER_ALREADY_EXISTS_FOR_KEY]: async () => {
+            // same buyer as the verified request: keys are scoped per buyer
             const res = await fetch(`http://127.0.0.1:${PROVIDER_PORT}/orders`, {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Idempotency-Key': IDEMPOTENCY_KEY },
+              headers: {
+                'Content-Type': 'application/json',
+                'Idempotency-Key': IDEMPOTENCY_KEY,
+                Authorization: `Bearer ${buyerToken}`,
+              },
               body: JSON.stringify({ items: [{ product_id: 'prod_1', quantity: 1 }] }),
             });
             if (!res.ok) throw new Error(`state handler POST /orders failed: ${res.status}`);
           },
+        },
+        requestFilter: (req, _res, next) => {
+          if (req.headers.authorization) req.headers.authorization = `Bearer ${buyerToken}`;
+          next();
         },
         logLevel: 'info',
       };
@@ -108,7 +125,9 @@ async function main() {
       await new Promise((resolve) => server.close(resolve));
     }
   } finally {
-    await container.stop();
+    const { closeResources } = require('../../app');
+    await closeResources();
+    await pg.stop();
     fs.rmSync(passwordFile, { force: true });
   }
 }

@@ -13,9 +13,11 @@ servers:
   - url: http://localhost:3000
     description: Local app running variant B
 
-# No authorization by default — deliberately, not an oversight. HW #23 adds
-# a Redis session (cookie `sid`), required only by the operations that
-# declare `security: [sessionCookie: []]` below; HW #24 adds real auth.
+# Public by default (catalog reads, login). HW #24: operations that act
+# on behalf of a user declare `security: [bearerAuth: []]` — an ES256
+# access token from POST /auth/login. 401 = no/invalid/revoked token
+# (refresh and retry); 403 = valid token, not allowed (don't refresh).
+# HW #23's cookie session (`sessionCookie`) guards only /sessions/current.
 security: []
 
 tags:
@@ -25,6 +27,8 @@ tags:
     description: Placing and viewing orders
   - name: sessions
     description: Redis-backed sessions with a rolling idle timeout (HW #23)
+  - name: auth
+    description: Token-based authentication — login, refresh rotation, logout (HW #24)
 
 paths:
   /products:
@@ -61,7 +65,9 @@ paths:
     post:
       operationId: createProduct
       tags: [products]
-      summary: Add a product to the catalog
+      summary: Add a product to the catalog — sellers and admins only (HW #24)
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -77,6 +83,10 @@ paths:
                 $ref: '#/components/schemas/Product'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /products/{productId}:
     get:
@@ -99,7 +109,9 @@ paths:
     get:
       operationId: listOrders
       tags: [orders]
-      summary: List orders, paged via an opaque cursor
+      summary: List the caller's own orders (all orders for an admin), paged via an opaque cursor
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -112,10 +124,14 @@ paths:
                 $ref: '#/components/schemas/OrderPage'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
     post:
       operationId: createOrder
       tags: [orders]
-      summary: Place an order (idempotent by client key)
+      summary: Place an order (idempotent by client key) — owned by the caller (the token's subject)
+      security:
+        - bearerAuth: []
       parameters:
         - name: Idempotency-Key
           in: header
@@ -165,6 +181,8 @@ paths:
                     created_at: '2026-09-10T12:05:00.000Z'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
@@ -178,7 +196,11 @@ paths:
     get:
       operationId: getOrder
       tags: [orders]
-      summary: Get one order by id
+      summary: >
+        Get one order by id — the owner's or, for an admin, anyone's. Another
+        buyer's order is 403 (authenticated, not allowed), not 401.
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/OrderId'
       responses:
@@ -188,6 +210,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -199,7 +225,9 @@ paths:
         Change an order's status. Triggers a realtime notification (HW #18)
         to every client subscribed to this order — via WebSocket (room
         `orders:<id>`) and via the equivalent SSE stream below — not just a
-        change to the stored record.
+        change to the stored record. Sellers and admins only (HW #24).
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -217,6 +245,10 @@ paths:
                 $ref: '#/components/schemas/Order'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
 
@@ -233,12 +265,11 @@ paths:
         OpenAPI validator middleware, the same way `/health` is (see
         app.js's own comment) — documented here for completeness, not
         enforced by express-openapi-validator. Supports `Last-Event-ID` for
-        resuming after a reconnect; see README's Testing section. If the
-        order has an owner (set at creation via `X-User-Id`), that same
-        header is required here too and must match, same rule the
-        WebSocket join enforces for the equivalent room — an order with no
-        recorded owner has none of this to check and streams openly, same
-        as plain `GET /orders/{orderId}` already does for it.
+        resuming after a reconnect; see README's Testing section. Same
+        ownership rule as `GET /orders/{orderId}` and the WebSocket join:
+        the owner or an admin, identified by the bearer token (HW #24).
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/OrderId'
       responses:
@@ -251,6 +282,8 @@ paths:
             text/event-stream:
               schema:
                 type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -268,6 +301,8 @@ paths:
         transactional outbox in that SAME transaction (HW #22) — a relay
         publishes it to RabbitMQ afterwards, at-least-once (see README,
         "Outbox та ідемпотентність").
+      security:
+        - bearerAuth: []
       parameters:
         - name: Idempotency-Key
           in: header
@@ -282,7 +317,7 @@ paths:
             order the first request placed instead of placing a second one —
             also when both requests arrive at the same time. The key, not the
             body, is what identifies the intent: two genuinely identical
-            orders just use two keys. Keys are scoped per buyer (`user_id`)
+            orders just use two keys. Keys are scoped per buyer (the token's subject)
             — two buyers using the same key don't collide. Reusing a key for
             a different request by the same buyer is rejected with 422.
       requestBody:
@@ -308,6 +343,8 @@ paths:
                 $ref: '#/components/schemas/CheckoutResult'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
         '409':
           description: Not enough stock, or not enough balance — nothing was committed
           content:
@@ -366,11 +403,11 @@ paths:
       operationId: createSession
       tags: [sessions]
       summary: >
-        Log in: creates a session in Redis and sets the `sid` cookie
-        (HttpOnly, SameSite=Lax). Identity only, by e-mail — there are no
-        passwords in this schema yet (HW #24 adds real authentication).
-        Rate-limited per client; an unknown e-mail is the same 401 as any
-        other failure, so this doesn't reveal which addresses exist.
+        Log in (cookie flavour, HW #23): checks e-mail + password with the
+        same verifier as `POST /auth/login` (HW #24), creates a session in
+        Redis and sets the `sid` cookie (HttpOnly, SameSite=Lax).
+        Rate-limited per (client, e-mail); an unknown e-mail is the same 401
+        as a wrong password, so this doesn't reveal which addresses exist.
       requestBody:
         required: true
         content:
@@ -427,8 +464,104 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /auth/login:
+    post:
+      operationId: login
+      tags: [auth]
+      summary: >
+        E-mail + password → an access token (ES256 JWT, 10 min) and an
+        opaque refresh token (14 days). Starts a new token family.
+        Rate-limited per (client, e-mail); unknown e-mail and wrong
+        password are the same 401.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Credentials'
+      responses:
+        '200':
+          description: A new token pair
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /auth/refresh:
+    post:
+      operationId: refreshTokens
+      tags: [auth]
+      summary: >
+        Rotate: a valid refresh token → a new pair; the presented token is
+        retired. Presenting an already-retired token is treated as theft
+        (RFC 9700 §4.14.2): the whole family is revoked — the attacker's
+        tokens and the honest client's alike — and the response is 401.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: A new token pair
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenPair'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [auth]
+      summary: >
+        Two actions in one transaction: the refresh-token family is revoked,
+        and this access token's `jti` is denylisted until its `exp`. After
+        this, neither token works.
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Logged out
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/me:
+    get:
+      operationId: getMe
+      tags: [auth]
+      summary: Who the access token says the caller is
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
 components:
   securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        `Authorization: Bearer <access_token>` from `POST /auth/login` or
+        `POST /auth/refresh`. ES256 only — any other `alg` is rejected.
     sessionCookie:
       type: apiKey
       in: cookie
@@ -492,7 +625,10 @@ components:
 
   responses:
     Unauthorized:
-      description: No valid session (missing, expired, or logged out) — or, for login, invalid credentials
+      description: >
+        Not authenticated: no credentials, or an invalid, expired or revoked
+        token / session — or, for a login, wrong credentials. A client
+        refreshes (or logs in again) on 401; it never does on 403.
       content:
         application/problem+json:
           schema:
@@ -542,7 +678,9 @@ components:
             $ref: '#/components/schemas/Problem'
 
     Forbidden:
-      description: The resource exists but does not belong to the caller
+      description: >
+        Authenticated, but not allowed: the resource belongs to someone
+        else, or the caller's role isn't enough. Refreshing won't help.
       content:
         application/problem+json:
           schema:
@@ -569,14 +707,68 @@ components:
           type: integer
 
     NewSession:
+      $ref: '#/components/schemas/Credentials'
+
+    Credentials:
       type: object
       additionalProperties: false
-      required: [email]
+      required: [email, password]
       properties:
         email:
           type: string
           format: email
           maxLength: 254
+        password:
+          type: string
+          minLength: 1
+          maxLength: 200
+
+    TokenPair:
+      type: object
+      additionalProperties: false
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: ES256-signed JWT (header `kid`), short-lived — see `expires_in`
+        refresh_token:
+          type: string
+          description: >
+            Opaque random string, NOT a JWT. Single use: every refresh
+            returns a new one and retires this one. Presenting a retired
+            one again revokes the whole login (all its refresh and access
+            tokens) — so a client must never refresh twice in parallel.
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          description: Access-token lifetime in seconds
+
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          maxLength: 200
+
+    Me:
+      type: object
+      additionalProperties: false
+      required: [user_id, role, expires_at]
+      properties:
+        user_id:
+          type: string
+        role:
+          type: string
+          enum: [buyer, seller, admin]
+          description: As of token issue — a cached copy of the user's role, valid until `expires_at`
+        expires_at:
+          type: string
+          format: date-time
 
     Session:
       type: object
@@ -595,12 +787,10 @@ components:
     CheckoutRequest:
       type: object
       additionalProperties: false
-      required: [user_id, product_id, quantity]
+      # HW #24: no user_id — the buyer is the bearer token's subject. A body
+      # field would let anyone buy (and spend the balance) "as" anyone.
+      required: [product_id, quantity]
       properties:
-        user_id:
-          type: string
-          pattern: '^[0-9]+$'
-          description: users.id (bigint, as a string)
         product_id:
           type: string
           pattern: '^[0-9]+$'

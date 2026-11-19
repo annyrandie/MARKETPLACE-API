@@ -51,6 +51,10 @@ test('Pact consumer: marketplace-web repeats an order request with the same Idem
       headers: {
         'Content-Type': 'application/json',
         'Idempotency-Key': IDEMPOTENCY_KEY,
+        // HW #24: POST /orders is authenticated. The contract pins the
+        // SHAPE (a bearer token), not a value — the provider verification
+        // substitutes a token it actually issues (requestFilter).
+        Authorization: regex('^Bearer \\S+$', 'Bearer contract-test-token'),
       },
       body: { items: [{ product_id: 'prod_1', quantity: 1 }] },
     })
@@ -72,7 +76,11 @@ test('Pact consumer: marketplace-web repeats an order request with the same Idem
   await provider.executeTest(async (mockServer) => {
     const res = await fetch(`${mockServer.url}/orders`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': IDEMPOTENCY_KEY },
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': IDEMPOTENCY_KEY,
+        Authorization: 'Bearer contract-test-token',
+      },
       body: JSON.stringify({ items: [{ product_id: 'prod_1', quantity: 1 }] }),
     });
     assert.equal(res.status, 201);

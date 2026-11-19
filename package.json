@@ -1,11 +1,13 @@
 {
   "name": "marketplace-api",
   "version": "1.0.0",
-  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16) + realtime WebSocket/SSE (HW #18) + async events over RabbitMQ (HW #19) + transactional outbox, relay, idempotent consumer (HW #22) + Redis: cache-aside/single-flight, sessions, shared rate limit, BullMQ queue (HW #23)",
+  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16) + realtime WebSocket/SSE (HW #18) + async events over RabbitMQ (HW #19) + transactional outbox, relay, idempotent consumer (HW #22) + Redis: cache-aside/single-flight, sessions, shared rate limit, BullMQ queue (HW #23) + auth: ES256 access tokens, refresh rotation with reuse detection, logout denylist, RBAC + ownership (HW #24)",
   "main": "app.js",
   "scripts": {
     "start": "npm run build --silent && node app.js",
     "start:dev": "npm run build --silent && node --watch app.js",
+    "start:vault": "npm run build --silent && bash scripts/with-secrets.sh dev node app.js",
+    "keys:generate": "node scripts/gen-jwt-keys.mjs",
     "check:env": "node scripts/check-env-example.mjs",
     "db:up": "bash scripts/up-db.sh",
     "db:rotate": "bash rotate.sh",
@@ -43,7 +45,10 @@
     "demo:session": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/demo-session.js",
     "demo:ratelimit": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/demo-ratelimit.js",
     "demo:queue": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/demo-queue.js",
-    "queue:worker": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/queue-worker.js"
+    "queue:worker": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/redis/queue-worker.js",
+    "demo:auth": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/auth/demo-auth.js",
+    "demo:reuse": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/auth/demo-reuse.js",
+    "demo:rbac": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/auth/demo-rbac.js"
   },
   "keywords": [],
   "author": "",
@@ -55,6 +60,7 @@
     "express": "^4.22.2",
     "express-openapi-validator": "^5.6.2",
     "ioredis": "^5.11.1",
+    "jsonwebtoken": "^9.0.3",
     "pg": "^8.22.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
@@ -66,6 +72,7 @@
     "@pact-foundation/pact": "^16.5.0",
     "@redocly/cli": "^2.46.0",
     "@testcontainers/postgresql": "^11.14.0",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.20.4",
     "@types/pg": "^8.23.1",
     "jest": "^30.5.2",

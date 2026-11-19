@@ -31,19 +31,14 @@ export function createOrderEventsSseHandler(events: OrderEventsService, getOrder
       next(problem(404, `Order "${orderId}" was not found`));
       return;
     }
-    // Ownership is enforced only when the order actually HAS an owner.
-    // An order created without X-User-Id (POST /orders never required it,
-    // before or after this HW) is already fully public — GET /orders/:id
-    // returns its status to anyone, no header needed — so its event
-    // stream being equally open isn't a new leak, just the same resource
-    // over a different transport. What WAS a real gap: an order that DOES
-    // have a recorded owner got the same open 200 here that an anonymous
-    // one does, even though the WebSocket join (orders.gateway.ts) was
-    // correctly refusing anyone but that owner for the identical room.
-    // `X-User-Id` is the same header POST /orders already reads.
+    // Ownership, the same rule as GET /orders/:id and the WebSocket join:
+    // the owner (or an admin) only. Since HW #24 the caller is the verified
+    // bearer token (requireAuth runs before this handler) and every order
+    // has an owner — POST /orders takes it from the token too. Before, both
+    // sides were an X-User-Id header: "the owner is whoever you typed in".
     if (order.userId) {
-      const userId = req.get('X-User-Id');
-      if (!userId || order.userId !== userId) {
+      const caller = req.auth;
+      if (!caller || (order.userId !== caller.sub && caller.role !== 'admin')) {
         next(problem(403, `"${orderId}" does not belong to the caller`));
         return;
       }
