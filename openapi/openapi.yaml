@@ -29,6 +29,8 @@ tags:
     description: Redis-backed sessions with a rolling idle timeout (HW #23)
   - name: auth
     description: Token-based authentication — login, refresh rotation, logout (HW #24)
+  - name: files
+    description: Direct-to-storage uploads (presigned PUT, resumable multipart) and downloads (HW #26)
 
 paths:
   /products:
@@ -553,6 +555,183 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /uploads/intent:
+    post:
+      operationId: createUploadIntent
+      tags: [files]
+      summary: >
+        Step 1 of 3 (HW #26). Declares an upload and returns presigned
+        URL(s) to PUT the bytes STRAIGHT to object storage — they never pass
+        through this API. The server generates the object key
+        (`uploads/{user}/{uuid}.{ext}`, extension from the content-type
+        allowlist); `filename` is kept for display only and never reaches
+        the key. Files above the multipart threshold (10 MiB) get one URL
+        per part; the part size is computed (≥ 5 MiB, ≥ size / 10 000).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+          description: >
+            Optional. A repeat with the same key (a double tap) returns the
+            SAME file with fresh URLs instead of creating a second object.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadIntentRequest'
+      responses:
+        '200':
+          description: The file row (PENDING) and where to PUT its bytes
+          headers:
+            Idempotency-Replay:
+              description: 'true if this repeats an intent made earlier with the same Idempotency-Key'
+              schema:
+                type: boolean
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadIntent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          description: Larger than this content type allows
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '415':
+          description: Content type not on the allowlist
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: This Idempotency-Key was already used for a different upload
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /uploads/{fileId}/parts:
+    get:
+      operationId: getUploadParts
+      tags: [files]
+      summary: >
+        The resume point of a multipart upload: asks the STORAGE (ListParts)
+        which parts it already holds and presigns only the missing ones. A
+        client that crashed mid-upload calls this and sends just the rest.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '200':
+          description: Parts already stored, and URLs for the missing ones
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadParts'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Not a multipart upload, or already completed
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /uploads/commit:
+    post:
+      operationId: commitUpload
+      tags: [files]
+      summary: >
+        Step 3 of 3. Nothing the client says is trusted: for multipart the
+        server completes the upload from the parts the storage reports; then
+        HeadObject — the object must exist and have the size declared at
+        intent — and the first bytes must match the declared type. Only then
+        COMPLETED. Idempotent: committing a completed file returns it again.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitRequest'
+      responses:
+        '200':
+          description: The file, COMPLETED
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileInfo'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Nothing (or not everything) was uploaded, or the size differs — a wrong-size object is discarded
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The content doesn't match the declared type — the object is discarded
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+  /files/{fileId}:
+    get:
+      operationId: downloadFile
+      tags: [files]
+      summary: >
+        302 to a fresh presigned GET that lives one minute. A presigned URL
+        can't be revoked, so it's never handed out long-lived: this endpoint
+        keeps the owner check on every access while the bytes still go
+        storage → client directly.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '302':
+          description: Redirect to the object (presigned, 60 s)
+          headers:
+            Location:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Upload not completed yet
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
 components:
   securitySchemes:
     bearerAuth:
@@ -614,6 +793,15 @@ components:
       schema:
         type: string
       description: Product identifier.
+
+    FileId:
+      name: fileId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: files.id
 
     OrderId:
       name: orderId
@@ -687,6 +875,142 @@ components:
             $ref: '#/components/schemas/Problem'
 
   schemas:
+    UploadIntentRequest:
+      type: object
+      additionalProperties: false
+      required: [content_type, size]
+      properties:
+        filename:
+          type: string
+          maxLength: 255
+          description: Display only — never part of the object key
+        content_type:
+          type: string
+          enum: [image/jpeg, image/png, image/webp, application/pdf, application/gzip, video/mp4]
+        size:
+          type: integer
+          minimum: 1
+          description: Exact size in bytes; signed into the PUT URL and re-checked at commit
+
+    PresignedPart:
+      type: object
+      additionalProperties: false
+      required: [part_number, url, start, end]
+      properties:
+        part_number:
+          type: integer
+        url:
+          type: string
+        start:
+          type: integer
+          description: First byte of the file in this part
+        end:
+          type: integer
+          description: Last byte of the file in this part (inclusive)
+
+    UploadIntent:
+      type: object
+      additionalProperties: false
+      required: [file_id, key, status, mode, expires_in]
+      properties:
+        file_id:
+          type: string
+          format: uuid
+        key:
+          type: string
+          description: Generated by the server — uploads/{user}/{uuid}.{ext}
+        status:
+          type: string
+          enum: [PENDING, COMPLETED]
+        mode:
+          type: string
+          enum: [single, multipart]
+        expires_in:
+          type: integer
+          description: Seconds the URL(s) stay valid
+        put:
+          type: object
+          description: mode=single — PUT the whole file here, with these headers
+          additionalProperties: false
+          required: [url, headers]
+          properties:
+            url:
+              type: string
+            headers:
+              type: object
+              additionalProperties:
+                type: string
+        part_size:
+          type: integer
+        parts_count:
+          type: integer
+        parts:
+          type: array
+          description: mode=multipart — one URL per part not yet stored
+          items:
+            $ref: '#/components/schemas/PresignedPart'
+
+    UploadParts:
+      type: object
+      additionalProperties: false
+      required: [file_id, part_size, parts_count, uploaded, missing, expires_in]
+      properties:
+        file_id:
+          type: string
+          format: uuid
+        part_size:
+          type: integer
+        parts_count:
+          type: integer
+        uploaded:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [part_number, size]
+            properties:
+              part_number:
+                type: integer
+              size:
+                type: integer
+        missing:
+          type: array
+          items:
+            $ref: '#/components/schemas/PresignedPart'
+        expires_in:
+          type: integer
+
+    CommitRequest:
+      type: object
+      additionalProperties: false
+      required: [file_id]
+      properties:
+        file_id:
+          type: string
+          format: uuid
+
+    FileInfo:
+      type: object
+      additionalProperties: false
+      required: [file_id, key, status, content_type, size]
+      properties:
+        file_id:
+          type: string
+          format: uuid
+        key:
+          type: string
+        status:
+          type: string
+          enum: [PENDING, COMPLETED]
+        content_type:
+          type: string
+        size:
+          type: integer
+        etag:
+          type: string
+          nullable: true
+          description: As reported by the storage. A multipart object's ETag ends in -N and is NOT the file's MD5.
+
     ProductCard:
       type: object
       additionalProperties: false
