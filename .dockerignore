@@ -7,3 +7,13 @@ secrets
 spec.json
 *.log
 .DS_Store
+# HW #28: the build-time secret is passed with --secret, never via the
+# context; local build output and infra state stay out too
+.npm_token
+dist
+.pulumi
+infra
+k8s
+test
+pacts
+backups

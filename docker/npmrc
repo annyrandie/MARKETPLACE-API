@@ -1,0 +1,10 @@
+# Build-time npm config. The token is NOT here — only a placeholder that
+# npm expands from the NPM_TOKEN env var, which exists solely inside the
+# `RUN --mount=type=secret,...,env=NPM_TOKEN` step (docker/Dockerfile).
+#
+# The registry is a scoped, fictional private one: this project has no
+# private packages, so npm never actually calls it — but the token is
+# wired exactly the way a real one would be, and demo:image proves it
+# leaves no trace in the image.
+@marketplace:registry=https://npm.pkg.marketplace.example/
+//npm.pkg.marketplace.example/:_authToken=${NPM_TOKEN}

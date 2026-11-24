@@ -55,7 +55,13 @@ client PUTs bytes straight to object storage on a presigned URL (the API
 can be down meanwhile), a commit that checks the storage with HeadObject,
 resumable multipart with a computed part size, and public assets served
 from a private bucket through a caching edge under content-hashed names,
-so a deploy needs zero invalidations. See [Files](#files) below.
+so a deploy needs zero invalidations. See [Files](#files) below. HW #28
+takes it to Kubernetes: a 4-stage distroless image (no shell, uid 65532,
+the build secret proven absent from history, config and layers), a
+computed vulnerability gate, and a kind cluster described entirely by a
+typed Pulumi program. A rolling update under load loses nothing:
+`failed=0` on ~290 000 requests, three runs in a row. See
+[Kubernetes](#kubernetes) below.
 
 ## Quickstart for the grader
 
@@ -94,7 +100,7 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `rotate.sh` | rotates the DB password with the app still running |
 | `scripts/up-db.sh` | brings up Postgres and aligns the role's password with the secret file |
 | `docker-compose.yml` | Postgres for local runs and the rotation demo |
-| `Dockerfile` + `.dockerignore` | app image with no secrets in any layer |
+| `docker/Dockerfile` + `docker/npmrc` + `.dockerignore` | HW #28: 4-stage production image, distroless `:nonroot`, build secret via BuildKit only (replaces HW #5's single-stage root `Dockerfile`) |
 | `init.sql` | creates `app_user`, the role the app connects as |
 | `db/schema.sql` | 4 tables, 3 FKs, `numeric` for money, generated `tsvector` column |
 | `db/seed.sql` | ≥100k skewed rows per table that needs it, ends in `VACUUM (ANALYZE)` |
@@ -180,6 +186,12 @@ equally, and B fits better with what this same server will do in HW #12–14.
 | `src/files/demo-upload.ts` / `demo-multipart.ts` / `demo-cdn.ts` / `demo-kit.ts` / `client-*.ts` | the three demos, their cleanup, and the credential-less client processes |
 | `policies/cloudfront-oac-bucket-policy.json` | the AWS form: OAC bucket policy with `AWS:SourceArn` |
 | `test/e2e/files.e2e.test.js` | uploads against RustFS in testcontainers |
+| `infra/` (`index.ts`, `Pulumi.yaml`, `package.json`) | HW #28: the typed Pulumi program — Namespace, Secret, Postgres, Deployment, NodePort Service, PDB, HPA |
+| `k8s/kind-config.yaml` / `scripts/cluster-up.sh` | the one-node kind cluster, NodePort 30080 on 127.0.0.1; image loading that works with the containerd store |
+| `scripts/pulumi.sh` | Pulumi on the local file backend, stack `dev` |
+| `scripts/load.mjs` / `scripts/scan.mjs` | the load generator (one status per line to a file); the computed scan gate (Trivy in a container) |
+| `demo/image.mjs` / `demo/rollout.mjs` / `demo/pdb.mjs` | `npm run demo:image` / `demo:rollout` / `demo:pdb` |
+| `.github/workflows/image-scan.yml` | CI: build with the BuildKit secret, `demo:image`, `npm run scan` at the working threshold |
 | `README.md` | this file |
 
 ## Resources and operations in the spec
@@ -507,6 +519,26 @@ npm run demo:upload
 npm run demo:multipart
 npm run demo:multipart
 npm run demo:cdn
+
+# HW #28 — Kubernetes. The JWT_* / STORAGE_* exports above are reused: the
+# app's fail-fast config needs them, so the Pulumi program puts them into
+# the K8s Secret too. Two more vault values + the local Pulumi backend:
+export APP_DB_PASSWORD=grader-secret-hw28
+export PULUMI_BACKEND_URL="file://$PWD/.pulumi"
+export PULUMI_CONFIG_PASSPHRASE=hw28-grading
+npm --prefix infra ci
+printf 'dummy-npm-token-%s' "$(openssl rand -hex 8)" > .npm_token   # build secret; not in git
+npm run image:build            # docker/Dockerfile -> marketplace-api:hw28
+npm run cluster:up             # kind create + load the images into the node
+npm run up                     # pulumi up (namespace: marketplace)
+npm run demo:image
+SCAN_MAX=-1    npm run scan; echo "exit(max=-1)=$?"
+SCAN_MAX=99999 npm run scan; echo "exit(max=99999)=$?"
+npm run demo:rollout
+kubectl -n marketplace get pdb marketplace-api -o jsonpath='{.status.disruptionsAllowed}{"\n"}'   # BEFORE demo:pdb
+npm run demo:pdb
+# namespace marketplace · deploy marketplace-api · pdb marketplace-api · hpa marketplace-api
+# tear down afterwards:  npm run destroy && npm run cluster:down
 ```
 
 (Port `6432`, not `5433` — every one of the commands above (`migrate`
@@ -1923,7 +1955,7 @@ lists them empty, only so that `check:env` stays honest.
 | `JWT_PUBLIC_KEY` | сховище (#11): `secrets/<env>/jwt_public_key.b64` | base64 PEM, SPKI | перевірка підпису |
 | `JWT_KID` | сховище (#11): `secrets/<env>/jwt_kid` | `[A-Za-z0-9._-]{1,64}` | `kid` у заголовку кожного токена |
 | `REFRESH_TOKEN_PEPPER` | сховище (#11): `secrets/<env>/refresh_token_pepper` | ≥ 32 символи | ключ HMAC для `token_hash` refresh-токенів |
-| `JWT_PREVIOUS_KID` / `JWT_PREVIOUS_PUBLIC_KEY` | сховище (#11), лише під час ротації ключа | як вище | перевірка токенів, підписаних попереднім ключем |
+| `JWT_PREVIOUS_KID` / `JWT_PREVIOUS_PUBLIC_KEY` | the vault (#11), **optional** — only during a key rotation | як вище | перевірка токенів, підписаних попереднім ключем |
 | `DB_URL`, `DB_PASSWORD_FILE` | `.env` / compose (HW #11) | — | Postgres; дев-креденшели, секретом не є |
 | `REDIS_URL`, `REDIS_QUEUE_URL` | `.env` / compose (HW #23) | — | Redis; дев-адреси без пароля |
 
@@ -2523,6 +2555,358 @@ move it to a cheaper storage class. Two honest caveats:
   restored before it can be downloaded.
 - **Lifecycle doesn't make a backup *verified*.** The restore drill from
   HW #15 still stands.
+
+## Kubernetes
+
+HW #28 changes the question from "does the image start?" (HW #5) to "does
+it survive an update under load?". The answer is a number counted from a
+file: **`failed=0` on 281 267 / 290 163 / 291 308 requests in three
+rollouts in a row.**
+
+### The cluster: kind, and how much memory
+
+**Brought up with kind v0.33.0** (one node, Kubernetes v1.37.0) on Docker
+Desktop with **7.75 GiB** total memory. The node uses **~0.65 GiB** after
+start and **~1.1 GiB** with the stack deployed: 3 × `api` at ~50 MB each,
+Postgres at ~27 MB, plus coredns, kube-proxy and kindnet.
+
+minikube was ruled out by memory: it refuses `--memory` below 1800 MB,
+while a kind node idles at about a third of that.
+
+`k8s/kind-config.yaml` publishes NodePort **30080** on `127.0.0.1` only.
+The load generator talks to it directly, with no ingress in between, so a
+failure shows up as *no response* (code `000`), not as a 502/503.
+
+```bash
+npm run cluster:up     # kind create (idempotent) + load images into the node
+npm run cluster:down   # kind delete cluster --name marketplace
+```
+
+**`kind load docker-image` doesn't work here.** With Docker Desktop's
+containerd image store, a pulled image is a multi-platform index, but only
+this machine's platform was actually downloaded. kind imports with
+`--all-platforms` and fails with `content digest …: not found`.
+`scripts/cluster-up.sh` therefore runs `docker save --platform linux/<arch>`
+followed by `kind load image-archive`, which works with both image stores.
+Re-run it after every rebuild: a host-built image doesn't exist in the
+node otherwise, and the pod hangs in `ErrImagePull` whatever
+`imagePullPolicy` says.
+
+### Variables
+
+| Змінна | Джерело | Навіщо |
+|---|---|---|
+| `APP_DB_PASSWORD` | сховище (#11): `secrets/<env>/app_db_password` | пароль Postgres у кластері; їде в K8s Secret → `POSTGRES_PASSWORD` (secretKeyRef) і файл пароля застосунку (Secret-том) |
+| `PULUMI_CONFIG_PASSPHRASE` | сховище (#11): `secrets/<env>/pulumi_config_passphrase` | ключ шифрування стану Pulumi: хто має його, читає всі секрети зі стану |
+| `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`, `JWT_KID`, `REFRESH_TOKEN_PEPPER` | сховище (#11) — див. [Auth](#auth) | конфіг застосунку (fail-fast) → K8s Secret → secretKeyRef |
+| `STORAGE_ACCESS_KEY`, `STORAGE_SECRET_KEY` | сховище (#11) — див. [Files](#files) | конфіг застосунку (fail-fast) → K8s Secret → secretKeyRef |
+| `PULUMI_BACKEND_URL` | wrapper default `file://$PWD/.pulumi` | локальний файловий бекенд — жодного `pulumi login` |
+| `.npm_token` (file) | local file, gitignored | секрет **етапу збірки**, лише `--secret id=npm_token` |
+
+The table uses one variable per row in the Auth/Files tables (they're
+listed there too). Every vault variable is **required with no default**:
+the Pulumi program checks them **as its first action**, before any call
+to the cluster, and stops with a named error:
+
+```
+error: missing from the vault: APP_DB_PASSWORD — run through scripts/with-secrets.sh (or export them, SKIP_VAULT=1); refusing to deploy without them
+```
+
+Without `PULUMI_CONFIG_PASSPHRASE`, Pulumi itself stops before the program
+runs, because it can't decrypt the stack, and names the variable.
+
+### The image: multi-stage, distroless, non-root
+
+`docker/Dockerfile` has **4 stages**: `deps` → `build` (tsc) →
+`prod-deps` → `runtime` on **`gcr.io/distroless/nodejs22-debian12:nonroot`**.
+
+The final stage has **no shell, no apt and no npm**, and runs as
+**uid 65532**. The point of distroless isn't size. It's what an attacker
+*lacks* after an RCE: there is no `sh` to exec.
+
+The final stage uses explicit `COPY`s only (never `COPY . .`), and the
+code is owned by root and read-only for the app user. In the cluster the
+container also runs with `readOnlyRootFilesystem`, `drop: [ALL]`,
+`allowPrivilegeEscalation: false` and `seccompProfile: RuntimeDefault`.
+
+`runAsUser: 65532` is a **number** on purpose. `runAsNonRoot` with the
+image's user *name* `nonroot` fails with `CreateContainerConfigError` —
+"image has non-numeric user", because kubelet doesn't resolve names.
+
+### The build secret: BuildKit, checked in three places
+
+`npm ci` sees a private-registry token only as
+`RUN --mount=type=secret,id=npm_token,env=NPM_TOKEN`. The value lives in
+the environment of that single `RUN` process. It is never written to a
+layer and never recorded in the history.
+
+The registry is a scoped, fictional one in `docker/npmrc` (the project has
+no private packages), and **`.npm_token` is the bait**: a random string
+that `demo:image` then searches for in three places:
+- `docker history --no-trunc`;
+- `docker image inspect`;
+- every blob of an unpacked `docker save`, searched byte-wise.
+
+```bash
+npm run demo:image
+# stages=4
+# shell-inside=0              # `docker run --entrypoint sh` (+ /bin/sh, /bin/bash, /busybox/sh) all fail
+# runtime-uid=65532           # process.getuid() inside the image
+# token-in-history=0
+# token-in-config=0
+# token-in-layers=0
+# control-in-layers=1         # positive control: a string that IS in the image is found
+# blobs-searched=34
+```
+
+**Control run: the same demo against a deliberately leaky image**, built
+from node:22-slim with `ARG NPM_TOKEN` and with `COPY token` + `RUN rm`:
+`shell-inside=1 runtime-uid=0 token-in-history=5 token-in-layers=2`,
+exit 1.
+- The ARG leak shows only in the history.
+- The COPY + rm leak shows only in the layers: the `rm` adds a whiteout,
+  and the bytes stay in the earlier layer.
+
+That is why there are three channels: no single tool sees both leaks.
+
+**Build secret vs runtime secret.** These are different things, and both
+are needed. The BuildKit secret lives during `docker build` and protects
+the **image**: it must never reach a registry. The K8s Secret lives at
+runtime and protects the **repository**: it must never reach git.
+
+### The vulnerability gate: computed, not declared
+
+```bash
+SCAN_MAX=-1    npm run scan   # gate=fail, exit 1
+SCAN_MAX=99999 npm run scan   # gate=pass, exit 0
+npm run scan                  # the working threshold, SCAN_MAX=10 (same as CI)
+```
+
+`scripts/scan.mjs` runs Trivy as a container (`aquasec/trivy:0.76.2`,
+reading the image over the Docker socket, so nothing is installed
+locally). It parses the JSON report and computes the gate:
+`found` = distinct (CVE, package) pairs at CRITICAL+HIGH **that have a
+fix**, and `gate = found <= SCAN_MAX`. It prints `image=`, `severity=`,
+`found=` (with a per-severity breakdown), `max-allowed=` and `gate=`. A
+failed scanner run is exit 2, never "pass by default".
+
+**This run's numbers:**
+- **First scan: `found=12`** (2 CRITICAL, 10 HIGH). Five of them were
+  transitive npm packages with a fix inside their semver ranges
+  (`proxy-addr`, `body-parser`, `fast-uri`, `multer`). A lockfile update
+  (`npm update …`) fixed them.
+- **After that: `found=7`**, all in the distroless base (`libssl3`). Only
+  Google's next rebuild of the base fixes those, and even
+  `gcr.io/distroless/nodejs22-debian12:nonroot` alone has them. The
+  scanner's database changes daily, which is why the criterion isn't
+  "the image must be green".
+- **Working threshold: `SCAN_MAX=10`.** `.github/workflows/image-scan.yml`
+  runs on push, pull requests and daily, and calls this same script. The
+  threshold is a ratchet: lower it when the base is fixed, and never
+  raise it without writing down why.
+
+### Probes: two questions, two paths
+
+| Probe | Path | Question | Answers from |
+|---|---|---|---|
+| readiness | `/readyz` | may I get traffic? | warm-up finished (the port isn't even open before) **and** no SIGTERM yet. Period 1 s, failureThreshold 1 |
+| liveness | `/healthz` | should I be killed? | the process alone. initialDelay 10 s, period 5 s, failureThreshold 3 |
+
+- **The two probes use different paths on purpose.** A liveness probe on
+  `/readyz` turns "temporarily not ready" (warming up, draining) into an
+  endless restart loop.
+- **Neither probe checks the database.** If the DB is down, every pod
+  would go unready at once and the Service would have no endpoints, so
+  the routes that don't need the DB would die with it. Liveness tied to
+  the DB is worse: it restarts healthy processes.
+- **The app warms up before `listen()`.** The DB pool must actually
+  connect, stretched to at least `WARMUP_MS=4000`, as a real service with
+  migrations and a pool would. Without that, the naive profile would
+  start faster than it can fail, and the measurement would be empty.
+
+### Rollout: the settings that give zero, and the measurement
+
+The `hardened` profile (`infra/index.ts`) uses four settings:
+- **`maxUnavailable: 0` + `maxSurge: 1`.** No old pod goes before a new
+  one is ready.
+- **readinessProbe with a 1 s period.** On SIGTERM the app first makes
+  `/readyz` return 503, and the pod leaves the Service within about a
+  second.
+- **Drain 5 s, then `close()`, inside a 15 s grace period.** During the
+  drain the app still serves everything that arrives, with
+  `Connection: close`, so a keep-alive client's next request opens a new
+  connection to a ready pod. Only then is the socket closed.
+  `terminationGracePeriodSeconds` (15) > `DRAIN_MS` (5) plus the close,
+  or kubelet would SIGKILL mid-drain (exit 137).
+- **livenessProbe on a different path** (see the table above).
+
+The order matters: `close()` first would refuse new connections while
+endpoints still route traffic to the pod.
+
+`demo:rollout`:
+1. Waits for a steady state: no terminating pods and 3 s of 200s.
+2. Starts `scripts/load.mjs`, with 16 keep-alive clients writing one
+   status per line to a temp file.
+3. After 2 s runs `pulumi config set rev <new>` + `pulumi up`. The pod
+   template changes, so all replicas roll. Rebuilding the same image tag
+   would change nothing.
+4. Waits 2 s more, then counts the file.
+
+```bash
+npm run demo:rollout                              # three runs in a row
+# profile=hardened requests=281267 ok=281267 failed=0 rollout-seconds=19.4
+# profile=hardened requests=290163 ok=290163 failed=0 rollout-seconds=19.9
+# profile=hardened requests=291308 ok=291308 failed=0 rollout-seconds=19.7
+
+ROLLOUT_PROFILE=naive npm run demo:rollout        # control: no probes, maxUnavailable 1, grace 1 s, no drain
+# profile=naive requests=76523 ok=62441 failed=14082 rollout-seconds=4.0  code-000=14082
+# profile=naive requests=75258 ok=74543 failed=715   rollout-seconds=4.4  code-000=715
+# profile=naive requests=83804 ok=72647 failed=11157 rollout-seconds=3.9  code-000=11157
+```
+
+The control run switches the Deployment to `naive` first, and **restores
+`hardened`** afterwards, so the cluster always ends in the correct
+profile. The numbers behave as expected:
+- **Zero on `hardened` is stable**, run after run.
+- **The naive failure share floats**: here between 1 % and 18 %, around
+  one request in six or seven, depending on how the rollout lines up with
+  the load.
+- **Every failure is a `000`, not a 5xx.** On a bare NodePort, a pod that
+  isn't listening yet (still warming up) or was killed mid-connection
+  gives *no response*.
+- **`hardened` takes ~5× longer (19.7 s vs ~4 s).** That's the price of
+  zero: each pod waits for a warmed-up replacement and then drains for
+  5 s.
+
+**A failure found along the way.** During a burst of naive-profile pod
+churn, one pod's warm-up `SELECT 1` hung for **24 minutes**, and the
+rollout waited on it the whole time (`rollout-seconds=933.9` in that
+run). `connectionTimeoutMillis` only covers getting a connection. Now the
+pool has `query_timeout`, and every warm-up attempt is bounded and
+retried. No startup I/O may wait forever.
+
+### PodDisruptionBudget
+
+`minAvailable: 2` of 3 replicas gives `disruptionsAllowed: 1`: room for
+one voluntary disruption (a node drain, an upgrade) at a time.
+
+- **`minAvailable == replicas` would allow zero.** Every drain would block
+  forever, which isn't "maximum protection".
+- **One replica plus a PDB protects nothing.**
+- **The budget only guards the Eviction API.** A plain
+  `kubectl delete pod` bypasses it by definition.
+
+```bash
+kubectl -n marketplace get pdb marketplace-api -o jsonpath='{.status.disruptionsAllowed}'   # 1 — before the demo
+npm run demo:pdb
+# healthy=3
+# minAvailable=2
+# disruptions-allowed-before=1
+# evict-1=201                 # POST …/pods/<pod>/eviction, status read over `kubectl proxy`
+# evict-2=429                 # "Cannot evict pod as it would violate the pod's disruption budget."
+# healthy-after-recovery=3    # the demo waits until the replacement is warm again
+```
+
+### HPA vs `spec.replicas`: who owns the field
+
+The HPA is declared as `autoscaling/v2`, with min 3, max 6 and a 70 %
+CPU target. kind has no metrics-server, so it shows
+`cpu: <unknown>/70%` and scales nothing. That's expected, and it's why
+the Deployment still declares `replicas: 3`.
+
+**In a real cluster with metrics-server, that's an ownership conflict
+over one field.** Two writers would touch `spec.replicas`: this program,
+which sets 3, and the HPA, which sets whatever the load needs. Every
+`pulumi up` would reset the HPA's decision back to 3, scaling down
+mid-spike, and the HPA would then scale back up.
+
+The program declares `ignoreChanges: ['spec.replicas']`. Pulumi sets the
+field at creation and never fights over it again. Equivalent alternatives:
+drop `replicas` from the spec once the HPA exists, or leave the field to
+the HPA's field manager under server-side apply.
+
+`minReplicas` is 3, not 2, on purpose. Scaling to 2 would leave the PDB
+(`minAvailable: 2`) with no room for an eviction, which brings back the
+drain blocker.
+
+### Runtime secrets: vault → Pulumi → K8s Secret → reference
+
+`npm run up` runs through `scripts/with-secrets.sh`, which reads
+`secrets/dev/`. The program wraps the values in `pulumi.secret()`, so
+they are encrypted in the state with the passphrase. It creates **one
+`Secret`** (`marketplace-secrets`) with `data` (base64).
+
+**`data`, not `stringData`.** `stringData` is write-only and never read
+back, so every `up` would show a diff. With `data`, `npm run up` twice in
+a row says **`10 unchanged`**.
+
+The Deployment holds **only references**:
+- `secretKeyRef` for `JWT_*`, `REFRESH_TOKEN_PEPPER` and `STORAGE_*`;
+- for Postgres, `POSTGRES_PASSWORD` through a `secretKeyRef`;
+- the app's DB password as a **Secret volume file**
+  (`DB_PASSWORD_FILE`, HW #11's rotation design). A mounted Secret is
+  updated in place, so a rotated password reaches new connections without
+  a restart.
+
+No value appears in the Deployment manifest.
+
+**Rotating a secret is a rolling update, not an outage.** This was found
+in this HW's own grader dry run, not designed up front. The run
+re-exported freshly generated JWT keys, `pulumi up` changed the Secret's
+data, and **`failed=52`** turned up in what should have been a rollout.
+
+The cause: by default pulumi-kubernetes **replaces** a Secret whose data
+changed. With a fixed name, that's delete-then-create, and every
+Deployment referencing the Secret got replaced too. All three API pods
+and Postgres were killed at once.
+
+The fix has two parts:
+- **`enableSecretMutable: true` on the provider.** The Secret is updated
+  in place.
+- **A `marketplace/secret-digest` annotation on each pod template.** It's
+  a 16-hex SHA-256 over the values, never a value itself. Its input
+  includes the 256-bit signing key, so it can't be brute-forced back.
+  Env vars from a Secret are only read at container start, and the digest
+  makes a rotated value restart the pods **through the normal rolling
+  update**.
+
+Measured: rotating `REFRESH_TOKEN_PEPPER` under load shows
+`Secret ~data` (in place) → `Deployment ~spec` (rolling; the old
+ReplicaSet stays, scaled to 0), with **195 177 requests, `failed=0`**.
+
+**Base64 is not encryption.** In this local cluster the Secret sits in
+etcd in plain text, because no encryption provider is configured. "Put it
+in a Secret" means "took it out of git", not "encrypted it". In
+production, etcd encryption at rest is a separate setting.
+
+**Production paths**, deliberately not installed here:
+- **External Secrets Operator** syncs from the real store (AWS Secrets
+  Manager, Vault, …) into a K8s Secret and keeps it updated, so no CI or
+  Pulumi run carries the value.
+- **Secrets Store CSI Driver** mounts the value straight from the store
+  as a file in the pod, without a K8s Secret object (or with an optional
+  synced one).
+
+Both remove the "the deployer machine sees every secret" step this local
+setup still has.
+
+### Pulumi: local backend, uncommitted stack file, no refresh
+
+- **`PULUMI_BACKEND_URL=file://$PWD/.pulumi`**, gitignored: no
+  `pulumi login` to anyone's account. The stack is `dev`, with the
+  passphrase secrets provider.
+- **Non-secret config lives in `infra/Pulumi.yaml`** as project-level
+  defaults: namespace, image, replicas, nodePort, profile, rev, kube
+  context. **`Pulumi.<stack>.yaml` is gitignored on purpose.** With the
+  passphrase provider it carries an `encryptionsalt` bound to *one*
+  passphrase, so committing it would make every other passphrase,
+  including the grader's, fail with "incorrect passphrase".
+- **The program is precompiled** (`tsc` → `infra/bin/`). `cd infra &&
+  npx tsc --noEmit` is the type check. The provider is explicit
+  (`context: kind-marketplace`), never "whatever kubectl points at".
+- **Don't run `pulumi refresh` on this stack.** It drops the Secret from
+  the state, and the next `up` fails with `already exists`. The cure is
+  `kubectl delete secret …` followed by `up`.
 
 ## Verification (acceptance criteria)
 

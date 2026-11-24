@@ -1,0 +1,48 @@
+# HW #28 — the image gate. Builds the production image (docker/Dockerfile)
+# and runs THE SAME `npm run scan` a human runs locally, with the project's
+# working threshold. The verdict comes from the scanner's report: found
+# CRITICAL+HIGH findings that have a fix vs SCAN_MAX; above it, the job
+# fails and the image doesn't ship.
+#
+# The threshold is a ratchet, not "zero": the remaining findings are in
+# the distroless base (libssl3) and only Google's next rebuild of it fixes
+# them. When they're fixed, lower SCAN_MAX — never raise it to make a red
+# build green without writing down why.
+name: image-scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 5 * * *' # the scanner's DB changes daily — so can the verdict
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Build-time secret: from the repo's Actions secrets when a private
+      # registry exists; until then a throwaway value — it's still passed
+      # ONLY via BuildKit's --secret, never as ARG or COPY.
+      - name: Build-time token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: printf '%s' "${NPM_TOKEN:-ci-dummy-$(openssl rand -hex 12)}" > .npm_token
+
+      - name: Build image (BuildKit secret)
+        run: npm run image:build
+
+      - name: Prove the secret stayed out of the image
+        run: npm run demo:image
+
+      - name: Vulnerability gate
+        env:
+          SCAN_MAX: '10'
+          SCAN_SEVERITY: CRITICAL,HIGH
+        run: npm run scan

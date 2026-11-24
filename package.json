@@ -1,7 +1,7 @@
 {
   "name": "marketplace-api",
   "version": "1.0.0",
-  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16) + realtime WebSocket/SSE (HW #18) + async events over RabbitMQ (HW #19) + transactional outbox, relay, idempotent consumer (HW #22) + Redis: cache-aside/single-flight, sessions, shared rate limit, BullMQ queue (HW #23) + auth: ES256 access tokens, refresh rotation with reuse detection, logout denylist, RBAC + ownership (HW #24) + files: presigned direct-to-storage uploads, resumable multipart, private bucket behind a caching edge, hashed immutable assets (HW #26)",
+  "description": "Marketplace API — OpenAPI contract (HW #9) + config/secrets (HW #11) + TypeORM data layer (HW #13) + concurrency: race-free checkout, SKIP LOCKED workers, retry (HW #14) + PgBouncer + backup/restore drill (HW #15) + testcontainers/E2E/Pact contract trust ladder (HW #16) + realtime WebSocket/SSE (HW #18) + async events over RabbitMQ (HW #19) + transactional outbox, relay, idempotent consumer (HW #22) + Redis: cache-aside/single-flight, sessions, shared rate limit, BullMQ queue (HW #23) + auth: ES256 access tokens, refresh rotation with reuse detection, logout denylist, RBAC + ownership (HW #24) + files: presigned direct-to-storage uploads, resumable multipart, private bucket behind a caching edge, hashed immutable assets (HW #26) + Kubernetes: distroless image, kind cluster via Pulumi, zero-failure rolling update, PDB, HPA (HW #28)",
   "main": "app.js",
   "scripts": {
     "start": "npm run build --silent && node app.js",
@@ -53,7 +53,16 @@
     "demo:multipart": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/files/demo-multipart.js",
     "demo:cdn": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/files/demo-cdn.js",
     "edge": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/files/edge.js",
-    "storage:init": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/files/storage-init.js"
+    "storage:init": "npm run build --silent && bash scripts/with-secrets.sh dev node dist/files/storage-init.js",
+    "image:build": "DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile --secret id=npm_token,src=.npm_token -t marketplace-api:hw28 .",
+    "cluster:up": "bash scripts/cluster-up.sh",
+    "cluster:down": "kind delete cluster --name marketplace",
+    "scan": "node scripts/scan.mjs",
+    "up": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh up",
+    "destroy": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh destroy",
+    "demo:image": "node demo/image.mjs",
+    "demo:rollout": "bash scripts/with-secrets.sh dev node demo/rollout.mjs",
+    "demo:pdb": "node demo/pdb.mjs"
   },
   "keywords": [],
   "author": "",

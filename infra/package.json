@@ -1,0 +1,18 @@
+{
+  "name": "marketplace-infra",
+  "private": true,
+  "description": "HW #28: everything that goes into the cluster, as a typed Pulumi program",
+  "main": "bin/index.js",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pulumi/kubernetes": "^4.35.0",
+    "@pulumi/pulumi": "^3.248.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "~6.0.3"
+  }
+}

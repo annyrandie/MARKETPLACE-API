@@ -68,6 +68,11 @@ const pool = new Pool({
   user: decodeURIComponent(dbUrl.username),
   password: async () => (await readFile(PASSWORD_FILE, 'utf8')).trim(),
   connectionTimeoutMillis: env.TIMEOUT_MS,
+  // HW #28: a bound on every query too — connectionTimeoutMillis only
+  // covers getting a connection. Found the hard way: during a burst of pod
+  // churn in kind, a warm-up `SELECT 1` hung for 24 minutes with nothing
+  // to stop it, and the rollout waited on that pod the whole time.
+  query_timeout: env.TIMEOUT_MS,
   max: 5,
 });
 
@@ -293,8 +298,37 @@ function hashBody(body) {
   return crypto.createHash('sha256').update(stableStringify(body ?? {})).digest('hex');
 }
 
+// HW #28: lifecycle state for the probes. `draining` flips on SIGTERM:
+// from that moment /readyz says "don't send me traffic" while the process
+// still serves whatever arrives, until the drain window is over.
+const lifecycle = { draining: false };
+
 function createApp() {
   const app = express();
+
+  // HW #28 — liveness: "should I be killed?". Answers from the process
+  // alone — no database, no Redis: a DB outage must never make kubelet
+  // restart healthy pods (that turns a partial outage into a restart loop).
+  app.get('/healthz', (req, res) => res.json({ status: 'alive' }));
+
+  // HW #28 — readiness: "may I get traffic?". Not before the warm-up
+  // finished (the server doesn't even listen until then), and not once
+  // SIGTERM arrived. Deliberately NOT tied to the database either: if the
+  // DB is down, every pod would go unready at once and the Service would
+  // have no endpoints — routes that don't need the DB would die with it.
+  app.get('/readyz', (req, res) => {
+    if (lifecycle.draining) return res.status(503).json({ status: 'draining' });
+    res.json({ status: 'ready' });
+  });
+
+  // While draining, every response tells the client to drop the
+  // keep-alive connection: its NEXT request opens a new connection, which
+  // the Service routes to a pod that is still ready. Without this, a
+  // client keeps reusing a socket to this pod until we close it under it.
+  app.use((req, res, next) => {
+    if (lifecycle.draining) res.set('Connection', 'close');
+    next();
+  });
 
   // Registered before the OpenAPI validator on purpose: /health is an
   // operational endpoint, not a business resource, so it isn't part of the
@@ -531,9 +565,75 @@ function createHttpServer() {
 
 module.exports = { createApp, createHttpServer, closeResources };
 
+/**
+ * HW #28 — the warm-up BEFORE listen(): what a real service does before it
+ * can take traffic (here: a DB pool that actually connects; migrations and
+ * cache warming in bigger services), stretched to at least WARMUP_MS.
+ * Until it's over the port isn't even open, so readiness can't pass early.
+ */
+async function warmUp() {
+  const started = Date.now();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      // each attempt is bounded on its own as well: no startup I/O may
+      // wait forever — a stuck attempt is abandoned and retried
+      await Promise.race([
+        pool.query('SELECT 1'),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(Object.assign(new Error('attempt timed out'), { code: 'ETIMEDOUT' })), env.TIMEOUT_MS + 1000).unref(),
+        ),
+      ]);
+      break;
+    } catch (err) {
+      log('warn', `warm-up: database not reachable yet (attempt ${attempt}: ${err.code ?? err.message}) — retrying`);
+      await new Promise((r) => setTimeout(r, Math.min(1000 * attempt, 5000)));
+    }
+  }
+  const rest = env.WARMUP_MS - (Date.now() - started);
+  if (rest > 0) await new Promise((r) => setTimeout(r, rest));
+  log('info', `warm-up done in ${Date.now() - started} ms`);
+}
+
+/**
+ * HW #28 — graceful shutdown, in THIS order:
+ *  1. readiness goes red (lifecycle.draining) — the endpoints controller
+ *     takes the pod out of the Service; until that propagates, traffic
+ *     still arrives and is still served (with `Connection: close`);
+ *  2. wait DRAIN_MS for that to happen;
+ *  3. only then close the listening socket and let in-flight requests end.
+ * close() first would refuse new connections while the load balancer is
+ * still sending them here. terminationGracePeriodSeconds must exceed
+ * DRAIN_MS + the close, or kubelet SIGKILLs mid-drain (exit 137).
+ */
+function handleSigterm(server) {
+  process.once('SIGTERM', () => {
+    lifecycle.draining = true;
+    log('info', `SIGTERM: readiness off, draining for ${env.DRAIN_MS} ms before closing the socket`);
+    setTimeout(() => {
+      server.close(async () => {
+        await closeResources().catch(() => {});
+        log('info', 'drained and closed — exiting');
+        process.exit(0);
+      });
+      server.closeIdleConnections?.();
+      // in-flight requests get a bounded tail, then we go anyway
+      setTimeout(() => process.exit(0), 5000).unref();
+    }, env.DRAIN_MS);
+  });
+}
+
 if (require.main === module) {
   log('info', `auth: ${auth.describe()}`);
-  createHttpServer().listen(env.PORT, () => {
-    log('info', `marketplace-api listening on http://localhost:${env.PORT} (WebSocket + SSE realtime enabled)`);
-  });
+  warmUp()
+    .then(() => {
+      const server = createHttpServer();
+      handleSigterm(server);
+      server.listen(env.PORT, () => {
+        log('info', `marketplace-api listening on http://localhost:${env.PORT} (WebSocket + SSE realtime enabled, rev=${process.env.REV ?? '-'})`);
+      });
+    })
+    .catch((err) => {
+      log('error', 'warm-up failed:', err.message);
+      process.exit(1);
+    });
 }
