@@ -1,0 +1,25 @@
+# Local cluster for HW #28: ONE node (control-plane that also runs pods).
+#
+#   npm run cluster:up     → kind create cluster --config k8s/kind-config.yaml
+#                            + kind load docker-image (images built on the host
+#                            don't exist inside the cluster otherwise:
+#                            ErrImagePull, whatever imagePullPolicy says)
+#   npm run cluster:down   → kind delete cluster --name marketplace
+#
+# kind, not minikube: on this machine's Docker (7.75 GiB) a kind node
+# idles at ~0.5 GiB and starts in seconds; minikube refuses --memory below
+# 1800 MB. See README, Kubernetes.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: marketplace
+nodes:
+  - role: control-plane
+    # The app's NodePort Service (30080, see infra/index.ts) published on
+    # the host — loopback only. demo:rollout's load generator hits it
+    # directly: a failure there shows up as "no response" (code 000), not
+    # as a 5xx — there's no ingress in between to translate it.
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        listenAddress: 127.0.0.1
+        protocol: TCP

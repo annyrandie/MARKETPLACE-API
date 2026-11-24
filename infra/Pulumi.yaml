@@ -1,0 +1,43 @@
+name: marketplace-k8s
+description: HW #28 — marketplace-api on a local kind cluster (Namespace, Secret, Postgres, Deployment, Service, PDB, HPA)
+# Precompiled (npm run build → bin/): the program is type-checked by the
+# project's own tsc, not by whatever TypeScript Pulumi's runtime bundles.
+runtime:
+  name: nodejs
+  options:
+    typescript: false
+main: bin/index.js
+
+# Non-secret configuration, with defaults, at PROJECT level. Per-stack files
+# (Pulumi.<stack>.yaml) are gitignored on purpose: with the passphrase
+# secrets provider each one carries an `encryptionsalt` bound to ONE
+# passphrase — committing it would make every other passphrase (the
+# grader's included) fail with "incorrect passphrase". Secret values never
+# live in config at all: the program reads them from the environment that
+# scripts/with-secrets.sh fills from the vault.
+config:
+  kubeContext:
+    type: string
+    default: kind-marketplace
+  namespace:
+    type: string
+    default: marketplace
+  image:
+    type: string
+    default: marketplace-api:hw28
+  replicas:
+    type: integer
+    default: 3
+  nodePort:
+    type: integer
+    default: 30080
+  # hardened = the zero-failure rollout; naive = no probes, maxUnavailable 1,
+  # no drain — the control run demo:rollout can switch to
+  profile:
+    type: string
+    default: hardened
+  # changed by demo:rollout to roll out a new revision: a rollout starts on
+  # a POD TEMPLATE change — rebuilding the same image tag changes nothing
+  rev:
+    type: string
+    default: "1"

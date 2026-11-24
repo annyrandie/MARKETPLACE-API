@@ -68,6 +68,12 @@ const envSchema = z.object({
   // revoked, so this is the only lever: 5 min (see README, Files). The cap
   // is deliberate — a "7 days because SigV4 allows it" config is refused.
   UPLOAD_URL_TTL_SECONDS: z.coerce.number().int().min(1).max(3600).default(300),
+
+  // HW #28 — lifecycle. WARMUP_MS: the minimum time before listen() (the
+  // DB pool must connect first in any case). DRAIN_MS: after SIGTERM, how
+  // long readiness stays red with the socket still open, before close().
+  WARMUP_MS: z.coerce.number().int().min(0).max(60000).default(0),
+  DRAIN_MS: z.coerce.number().int().min(0).max(60000).default(5000),
 }).superRefine((env, ctx) => {
   // Parse the keys NOW, before anything listens: a broken key should stop
   // the process at boot, not fail the first login an hour later.

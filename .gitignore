@@ -19,3 +19,9 @@ backups/
 # stale copy would just drift from whatever the consumer test currently
 # describes.
 pacts/
+
+# HW #28: build-time secret bait/real token — passed to BuildKit with --secret, never committed
+.npm_token
+# HW #28: local Pulumi file backend + stack config (its encryptionsalt is bound to one passphrase)
+.pulumi/
+infra/Pulumi.*.yaml

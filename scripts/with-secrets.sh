@@ -122,4 +122,14 @@ export STORAGE_ENDPOINT="${STORAGE_ENDPOINT-http://127.0.0.1:9100}"
 export STORAGE_BUCKET="${STORAGE_BUCKET:-marketplace-files}"
 export STORAGE_REGION="${STORAGE_REGION:-us-east-1}"
 
+# HW #28: the deployment's own secrets. APP_DB_PASSWORD becomes the
+# in-cluster Postgres password and the app's password file (via a K8s
+# Secret); PULUMI_CONFIG_PASSPHRASE encrypts Pulumi's state — whoever has
+# it can read every secret value stored in that state. Vault only, per
+# environment, no fallback. The Pulumi backend is a local directory, not
+# an account: an address, not a secret.
+from_vault APP_DB_PASSWORD app_db_password
+from_vault PULUMI_CONFIG_PASSPHRASE pulumi_config_passphrase
+export PULUMI_BACKEND_URL="${PULUMI_BACKEND_URL:-file://$ROOT/.pulumi}"
+
 exec "$@"
